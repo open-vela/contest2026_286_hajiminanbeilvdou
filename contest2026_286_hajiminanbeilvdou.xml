@@ -9,8 +9,11 @@
   <include name="openvela.xml"/>
 
   <project path="contest2026_286_hajiminanbeilvdou" name="contest2026_286_hajiminanbeilvdou">
-    <linkfile src="app/hello_app" dest="packages/demos/contest2026_286_hello_app"/>
-    <linkfile src="quickapp/hello_quickapp" dest="packages/apps/contest2026_286_hello_quickapp"/>
-    <linkfile src="board/contest_board" dest="vendor/openvela/boards/contest2026_286_board"/>
+    <!-- Agent voice UI application layer (screen + PTT + Chinese font).
+         The remaining system-level code lives under src/ + docs/upstream/
+         and is applied to the ai_agent / vendor_sifli / apps tree by
+         patch (see docs/upstream/README.md) - it cannot be expressed as a
+         linkfile because it lives inside the production repositories. -->
+    <linkfile src="app/agent_voice" dest="packages/demos/contest2026_286_agent_voice"/>
   </project>
 </manifest>

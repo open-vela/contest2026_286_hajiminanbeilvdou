@@ -1,0 +1,82 @@
+{
+  "schema_version": "1.0",
+  "team_id": "contest2026_286_hajiminanbeilvdou",
+  "github_login": "Oliweitz",
+  "generator": "claude-code-collector@1.3.0",
+  "updated_at": "2026-09-17T04:42:13.226Z",
+  "sessions": [
+    {
+      "session_id": "5025c51a-d78f-4922-9132-fa11acd29bd9",
+      "tool": "claude-code",
+      "started_at": "2026-09-12T08:32:14.978Z",
+      "last_event_at": "2026-09-12T13:55:05.648Z",
+      "event_count": 1653,
+      "raw_event_count": 2473,
+      "file_path": "logs/Oliweitz/2026-09-12/claude-code__5025c51a-d78f-4922-9132-fa11acd29bd9.jsonl",
+      "collection_mode": "cli",
+      "health": "ok",
+      "model": "deepseek-v4-pro"
+    },
+    {
+      "session_id": "27241a16-fd92-4412-8e49-69dc477094e4",
+      "tool": "claude-code",
+      "started_at": "2026-09-12T08:45:04.979Z",
+      "last_event_at": "2026-09-12T08:45:04.979Z",
+      "event_count": 107,
+      "raw_event_count": 151,
+      "file_path": "logs/Oliweitz/2026-09-12/claude-code__27241a16-fd92-4412-8e49-69dc477094e4.jsonl",
+      "collection_mode": "cli",
+      "health": "ok",
+      "model": "deepseek-v4-pro"
+    },
+    {
+      "session_id": "d3be712f-83f6-44fd-9d75-b88c81e19bc5",
+      "tool": "claude-code",
+      "started_at": "2026-09-13T10:04:47.794Z",
+      "last_event_at": "2026-09-13T11:16:21.416Z",
+      "event_count": 1768,
+      "raw_event_count": 2732,
+      "file_path": "logs/Oliweitz/2026-09-13/claude-code__d3be712f-83f6-44fd-9d75-b88c81e19bc5.jsonl",
+      "collection_mode": "cli",
+      "health": "ok",
+      "model": "deepseek-v4-flash"
+    },
+    {
+      "session_id": "1461abb0-c4c0-4255-a0a2-77415cb4911d",
+      "tool": "claude-code",
+      "started_at": "2026-09-14T09:06:08.359Z",
+      "last_event_at": "2026-09-14T13:08:55.830Z",
+      "event_count": 1329,
+      "raw_event_count": 2030,
+      "file_path": "logs/Oliweitz/2026-09-14/claude-code__1461abb0-c4c0-4255-a0a2-77415cb4911d.jsonl",
+      "collection_mode": "cli",
+      "health": "ok",
+      "model": "deepseek-flash"
+    },
+    {
+      "session_id": "d99b5262-3857-4742-a65e-d123f82f125b",
+      "tool": "claude-code",
+      "started_at": "2026-09-16T08:44:55.720Z",
+      "last_event_at": "2026-09-16T15:03:03.434Z",
+      "event_count": 2583,
+      "raw_event_count": 3929,
+      "file_path": "logs/Oliweitz/2026-09-16/claude-code__d99b5262-3857-4742-a65e-d123f82f125b.jsonl",
+      "collection_mode": "cli",
+      "health": "ok",
+      "model": "deepseek-flash",
+      "redacted_count_total": 1
+    },
+    {
+      "session_id": "6152a00f-cb0b-4dbd-ad22-a378c2481365",
+      "tool": "claude-code",
+      "started_at": "2026-09-17T04:33:16.850Z",
+      "last_event_at": "2026-09-17T04:42:13.222Z",
+      "event_count": 110,
+      "raw_event_count": 175,
+      "file_path": "logs/Oliweitz/2026-09-17/claude-code__6152a00f-cb0b-4dbd-ad22-a378c2481365.jsonl",
+      "collection_mode": "cli",
+      "health": "ok",
+      "model": "deepseek-flash"
+    }
+  ]
+}

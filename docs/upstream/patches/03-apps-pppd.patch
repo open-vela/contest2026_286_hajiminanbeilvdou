@@ -1,0 +1,238 @@
+diff --git a/examples/pppd/pppd_main.c b/examples/pppd/pppd_main.c
+index ce80ae90b..ffbe0a5a8 100644
+--- a/examples/pppd/pppd_main.c
++++ b/examples/pppd/pppd_main.c
+@@ -50,17 +50,16 @@
+  * Private Data
+  ****************************************************************************/
+ 
+-static FAR const char connect_script[] =
+-  "ECHO ON "
+-  "TIMEOUT 30 "
+-  "\"\" ATE1 "
+-  "OK AT+CGDCONT=1,\\\"IP\\\",\\\"internet\\\" "
+-  "OK ATD*99***1# "
+-  "CONNECT \\c";
++/* Null-modem link (direct wire to a host pppd server): no AT dialing,
++ * the PPP peer is already on the wire.  NULL scripts skip chat entirely.
++ */
++static FAR const char *connect_script = NULL;
++static FAR const char *disconnect_script = NULL;
+ 
+-static FAR const char disconnect_script[] =
+-  "\"\" ATZ "
+-  "OK \\c";
++/* Local address to request during IPCP (192.168.223.2).  The host side is
++ * configured with the matching 192.168.223.1:192.168.223.2 pair.
++ */
++#define PPP_LOCAL_IP 0xC0A8DF02
+ 
+ /****************************************************************************
+  * Public Functions
+@@ -76,7 +75,12 @@ int main(int argc, char *argv[])
+   {
+     .disconnect_script = disconnect_script,
+     .connect_script = connect_script,
+-    .ttyname = "/dev/ttyS1",
++    /* The board registers the console UART only as /dev/console (the ttySx
++     * loop in sifli_uart.c explicitly skips it), so that is the line that
++     * actually carries the CH340 link the peer is on.
++     */
++    .ttyname = "/dev/console",
++    .local_ip = { .s_addr = htonl(PPP_LOCAL_IP) },
+ #ifdef CONFIG_NETUTILS_PPPD_PAP
+     .pap_username = "user",
+     .pap_password = "pass",
+diff --git a/include/netutils/pppd.h b/include/netutils/pppd.h
+index 4e24e3f94..853770df5 100644
+--- a/include/netutils/pppd.h
++++ b/include/netutils/pppd.h
+@@ -26,6 +26,7 @@
+  ****************************************************************************/
+ 
+ #include <nuttx/config.h>
++#include <netinet/in.h>
+ #include <time.h>
+ 
+ /****************************************************************************
+@@ -54,6 +55,14 @@ struct pppd_settings_s
+ 
+   char ttyname[TTYNAMSIZ];
+ 
++  /* Local IP address to request from the peer during IPCP.
++   * Zero (the default) means "negotiate": ask for 0.0.0.0 and adopt the
++   * address the peer offers in a ConfNak.  Set it to skip that exchange,
++   * which some peers (and simple null-modem servers) never complete.
++   */
++
++  struct in_addr local_ip;
++
+ #ifdef CONFIG_NETUTILS_PPPD_PAP
+   /* PAP Authentication Settings */
+ 
+diff --git a/netutils/pppd/ipcp.c b/netutils/pppd/ipcp.c
+index 56636998e..a2010e78b 100644
+--- a/netutils/pppd/ipcp.c
++++ b/netutils/pppd/ipcp.c
+@@ -311,6 +311,18 @@ void ipcp_rx(FAR struct ppp_context_s *ctx, FAR uint8_t * buffer,
+ 
+       /* ppp_ipcp_state &= ~IPCP_RX_UP; */
+ 
++      /* Apply the acknowledged address to the interface.  Historically this
++       * only happened in the ConfNak path, so a peer that simply ACKs our
++       * ConfReq (i.e. a statically configured local address) left the
++       * interface unconfigured.
++       */
++
++      if (ctx->local_ip.s_addr != 0)
++        {
++          netlib_ifup((FAR char *)ctx->ifname);
++          netlib_set_ipv4addr((FAR char *)ctx->ifname, &ctx->local_ip);
++        }
++
+       DEBUG1(("were up!\n"));
+       printip(ctx->local_ip);
+ #ifdef IPCP_GET_PRI_DNS
+diff --git a/netutils/pppd/ppp.c b/netutils/pppd/ppp.c
+index 0e27617fd..3066b5434 100644
+--- a/netutils/pppd/ppp.c
++++ b/netutils/pppd/ppp.c
+@@ -45,6 +45,7 @@
+ 
+ #include "ppp_conf.h"
+ #include "ppp_arch.h"
++#include "netutils/pppd.h"
+ #include "ppp.h"
+ #include "ahdlc.h"
+ #include "ipcp.h"
+@@ -189,6 +190,15 @@ void ppp_connect(FAR struct ppp_context_s *ctx)
+   ipcp_init(ctx);
+   lcp_init(ctx);
+ 
++  /* A statically configured local address overrides the "ask the peer"
++   * default of 0.0.0.0.
++   */
++
++  if (ctx->settings != NULL && ctx->settings->local_ip.s_addr != 0)
++    {
++      ctx->local_ip = ctx->settings->local_ip;
++    }
++
+   /* Enable PPP */
+ 
+   ctx->ppp_flags = PPP_RX_READY;
+@@ -218,11 +228,26 @@ void ppp_poll(FAR struct ppp_context_s *ctx)
+ 
+   ctx->ip_len = 0;
+ 
+-  ++ctx->ip_no_data_time;
+-  if (ctx->ip_no_data_time > PPP_IP_TIMEOUT)
++  /* "No IP traffic for six hours, hang up" is a dial-up rule: an idle phone
++   * line costs money, so the modem drops it. A direct serial link has nothing
++   * to hang up and nothing to redial, so here the rule can only do harm --
++   * and it fires far sooner than six hours anyway, because the counter is
++   * bumped once per call to ppp_poll() rather than once per second. The
++   * caller polls in a loop, so a link carrying traffic reaches a nominal
++   * 21600 in minutes and tears itself down mid-transfer.
++   *
++   * Only apply it when a connect script exists, i.e. when there really is a
++   * modem to reconnect.
++   */
++
++  if (ctx->settings != NULL && ctx->settings->connect_script != NULL)
+     {
+-      ppp_reconnect(ctx);
+-      return;
++      ++ctx->ip_no_data_time;
++      if (ctx->ip_no_data_time > PPP_IP_TIMEOUT)
++        {
++          ppp_reconnect(ctx);
++          return;
++        }
+     }
+ 
+   if (!(ctx->ppp_flags & PPP_RX_READY))
+diff --git a/netutils/pppd/ppp_conf.h b/netutils/pppd/ppp_conf.h
+index 7768dff90..f922171c7 100644
+--- a/netutils/pppd/ppp_conf.h
++++ b/netutils/pppd/ppp_conf.h
+@@ -56,9 +56,40 @@
+ #define xxdebug_printf          ninfo
+ #define debug_printf            ninfo
+ 
+-#define PPP_RX_BUFFER_SIZE      1024 //1024  //GD 2048 for 1280 IPv6 MTU
++/* ip_buf[] and ahdlc_rx_buffer[] are both this size, and it also becomes the
++ * MRU advertised to the peer. It has to hold one whole PPP frame un-escaped:
++ * protocol (2) + IP packet + FCS (2).
++ *
++ * Left at 1024 because it has to move together with CONFIG_NET_TUN_PKTSIZE.
++ * Raising both lifts the TCP MSS off 256 and recovers about a fifth of the
++ * link, but it also destabilises this board's PPP link -- the interface stops
++ * answering LCP echo. See the note on CONFIG_NET_TUN_PKTSIZE in the agent
++ * defconfig before changing either.
++ */
++
++#define PPP_RX_BUFFER_SIZE      1024
++
++/* Off, because this counter does not measure what it claims to.
++
++ * ahdlc_tx() bumps it on every frame transmitted and the receive path clears
++ * it on every frame received with a good CRC, and when it passes 5 the link
++ * is declared dead. That is a dial-up assumption twice over: a modem's TX
++ * queue really can back up while a call is up, and recovering by redialling
++ * is the right response. Over a direct serial cable there is no modem, no
++ * dial tone and nothing to redial -- and ppp_reconnect() marks the interface
++ * down for four seconds and writes "+++" and "ATE1" into the middle of the
++ * PPP byte stream, which is where those stray strings in a capture come
++ * from.
++ *
++ * On this link the counter trips in ordinary use. A 4 KB audio frame leaves
++ * as sixteen 256 byte frames back to back, so a handful of them can go out
++ * between two ACKs and the "outstanding" count reaches the limit while the
++ * link is working perfectly. The reconnect that follows is what actually
++ * drops the connection: the host sees the interface stop answering LCP echo
++ * and gives up.
++ */
+ 
+-#define AHDLC_TX_OFFLINE        5
++#define AHDLC_TX_OFFLINE        0
+ 
+ #define IPCP_GET_PEER_IP        1
+ 
+diff --git a/netutils/pppd/pppd.c b/netutils/pppd/pppd.c
+index cc3d2b047..2ec8acf4d 100644
+--- a/netutils/pppd/pppd.c
++++ b/netutils/pppd/pppd.c
+@@ -50,6 +50,7 @@
+ #include <fcntl.h>
+ #include <errno.h>
+ #include <poll.h>
++#include <termios.h>
+ #include <time.h>
+ #include <debug.h>
+ #include <unistd.h>
+@@ -143,6 +144,7 @@ static int tun_alloc(char *dev)
+ 
+ static int open_tty(const char *dev)
+ {
++  struct termios tio;
+   int fd;
+   int errcode;
+ 
+@@ -151,6 +153,16 @@ static int open_tty(const char *dev)
+       return fd;
+     }
+ 
++  /* Put the line into raw mode: PPP frames must not be echoed back,
++   * line-disciplined, or post-processed by the tty layer.
++   */
++
++  if (tcgetattr(fd, &tio) == OK)
++    {
++      cfmakeraw(&tio);
++      tcsetattr(fd, TCSANOW, &tio);
++    }
++
+   if ((errcode = make_nonblock(fd)) < 0)
+     {
+       close(fd);
