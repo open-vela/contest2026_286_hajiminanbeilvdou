@@ -183,7 +183,7 @@
 #define AGENT_CRON_MAX_JOBS 16
 #define AGENT_CRON_CHECK_INTERVAL_MS (10 * 1000)
 #define AGENT_CRON_ID_LEN 9 /* 8 hex chars + NUL */
-#define AGENT_CRON_STACK (8 * 1024)
+#define AGENT_CRON_STACK (16 * 1024)
 #define AGENT_CRON_PRIO 40
 #define AGENT_HEARTBEAT_FILE AGENT_DATA_DIR "/HEARTBEAT.md"
 #define AGENT_HEARTBEAT_INTERVAL_MS (30 * 60 * 1000)
@@ -313,9 +313,19 @@
 #define AGENT_WEIXIN_STACK (12 * 1024)
 #define AGENT_WEIXIN_PRIO 45
 
+/* ── Microphone uplink ─────────────────────────────────────── */
+/* Capture thread. It formats a chunk, hands it to the WS layer and repeats,
+ * which means cJSON and the socket send path run on this stack -- 4 KB left
+ * no headroom for either. */
+#define AGENT_MIC_STREAM_STACK (8 * 1024)
+
 /* ── LVGL UI Channel ───────────────────────────────────────── */
 #ifdef CONFIG_AI_AGENT_LVGL_UI
-#define AGENT_LVGL_UI_STACK (16 * 1024)
+/* Driven by the deepest widget tree lv_timer_handler() has to walk, not by
+ * the size of the code -- 16 KB was measurably not enough: the UI thread
+ * overran it and corrupted a neighbouring allocation, which showed up as an
+ * unrelated assertion in sem_waitirq.c. */
+#define AGENT_LVGL_UI_STACK (32 * 1024)
 #define AGENT_LVGL_UI_PRIO 45
 #endif
 

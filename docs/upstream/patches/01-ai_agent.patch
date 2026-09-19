@@ -78,7 +78,7 @@ index 84628d8..001ed01 100644
  	bool "Enable Feishu bot channel"
  	default y
 diff --git a/include/agent_config.h b/include/agent_config.h
-index 711bb6d..6052d04 100644
+index 711bb6d..45b40cc 100644
 --- a/include/agent_config.h
 +++ b/include/agent_config.h
 @@ -115,14 +115,23 @@
@@ -108,6 +108,36 @@ index 711bb6d..6052d04 100644
  
  /* ── Timezone (POSIX TZ format) ────────────────────────────── */
  #define AGENT_TIMEZONE "CST-8"
+@@ -174,7 +183,7 @@
+ #define AGENT_CRON_MAX_JOBS 16
+ #define AGENT_CRON_CHECK_INTERVAL_MS (10 * 1000)
+ #define AGENT_CRON_ID_LEN 9 /* 8 hex chars + NUL */
+-#define AGENT_CRON_STACK (8 * 1024)
++#define AGENT_CRON_STACK (16 * 1024)
+ #define AGENT_CRON_PRIO 40
+ #define AGENT_HEARTBEAT_FILE AGENT_DATA_DIR "/HEARTBEAT.md"
+ #define AGENT_HEARTBEAT_INTERVAL_MS (30 * 60 * 1000)
+@@ -304,9 +313,19 @@
+ #define AGENT_WEIXIN_STACK (12 * 1024)
+ #define AGENT_WEIXIN_PRIO 45
+ 
++/* ── Microphone uplink ─────────────────────────────────────── */
++/* Capture thread. It formats a chunk, hands it to the WS layer and repeats,
++ * which means cJSON and the socket send path run on this stack -- 4 KB left
++ * no headroom for either. */
++#define AGENT_MIC_STREAM_STACK (8 * 1024)
++
+ /* ── LVGL UI Channel ───────────────────────────────────────── */
+ #ifdef CONFIG_AI_AGENT_LVGL_UI
+-#define AGENT_LVGL_UI_STACK (16 * 1024)
++/* Driven by the deepest widget tree lv_timer_handler() has to walk, not by
++ * the size of the code -- 16 KB was measurably not enough: the UI thread
++ * overran it and corrupted a neighbouring allocation, which showed up as an
++ * unrelated assertion in sem_waitirq.c. */
++#define AGENT_LVGL_UI_STACK (32 * 1024)
+ #define AGENT_LVGL_UI_PRIO 45
+ #endif
+ 
 diff --git a/src/agent_main.c b/src/agent_main.c
 index 9d676c2..9fa4908 100644
 --- a/src/agent_main.c
@@ -508,10 +538,10 @@ index 0000000..dfb0130
 +void cmd_mic_rate(int argc, char** argv);
 diff --git a/src/channels/mic_stream.c b/src/channels/mic_stream.c
 new file mode 100644
-index 0000000..f2fce6f
+index 0000000..4966e43
 --- /dev/null
 +++ b/src/channels/mic_stream.c
-@@ -0,0 +1,249 @@
+@@ -0,0 +1,250 @@
 +/*
 + * Copyright (C) 2026 Xiaomi Corporation
 + *
@@ -537,6 +567,7 @@ index 0000000..f2fce6f
 +#include "channels/mic_stream.h"
 +#include "channels/ws_server.h"
 +#include "agent_compat.h"
++#include "agent_config.h"
 +
 +#include "sf32lb_audcodec.h"
 +
@@ -706,7 +737,7 @@ index 0000000..f2fce6f
 +
 +    pthread_attr_t attr;
 +    pthread_attr_init(&attr);
-+    pthread_attr_setstacksize(&attr, 4096);
++    pthread_attr_setstacksize(&attr, AGENT_MIC_STREAM_STACK);
 +
 +    int ret = pthread_create(&s_thread, &attr, mic_stream_thread, NULL);
 +    pthread_attr_destroy(&attr);
@@ -87063,7 +87094,7 @@ index 0000000..dcb20e4
 +#endif /*#if LV_FONT_MISANS_18_CJK*/
 +
 diff --git a/src/ui/lvgl_ui_channel.c b/src/ui/lvgl_ui_channel.c
-index 6855dd9..8df8ac6 100644
+index 6855dd9..6bfcf1f 100644
 --- a/src/ui/lvgl_ui_channel.c
 +++ b/src/ui/lvgl_ui_channel.c
 @@ -24,6 +24,7 @@
@@ -87283,7 +87314,7 @@ index 6855dd9..8df8ac6 100644
  int lvgl_ui_channel_start(void)
  {
      if (!s_state.initialized) {
-@@ -365,10 +472,30 @@ int lvgl_ui_channel_start(void)
+@@ -365,10 +472,44 @@ int lvgl_ui_channel_start(void)
  
      s_state.running = true;
  
@@ -87295,8 +87326,22 @@ index 6855dd9..8df8ac6 100644
 +     * lv_timer_handler() and processes our widgets — nothing to do here.
 +     * Standalone, nobody would pump the loop, so run one ourselves. */
 +    if (s_state.lvgl_owned) {
-+        if (pthread_create(&s_state.lvgl_thread, NULL, lvgl_event_loop, NULL)
-+            != 0) {
++        /* Explicit stack size. This was passing NULL, so the thread got the
++         * default (AGENT_LVGL_UI_STACK was defined but never referenced) --
++         * and lv_timer_handler() walks the widget tree recursively, so the
++         * deepest screen is what decides how much is needed. Overflowing it
++         * smashes whatever the allocator put next door, which surfaces far
++         * away as corrupt mutex bookkeeping (sem_waitirq.c) rather than as
++         * anything pointing at the UI. */
++        pthread_attr_t attr;
++
++        pthread_attr_init(&attr);
++        pthread_attr_setstacksize(&attr, AGENT_LVGL_UI_STACK);
++        int rc = pthread_create(&s_state.lvgl_thread, &attr, lvgl_event_loop,
++                                NULL);
++        pthread_attr_destroy(&attr);
++
++        if (rc != 0) {
 +            syslog(LOG_ERR, "[%s] failed to start LVGL event loop\n", TAG);
 +            s_state.running = false;
 +            return -EIO;
@@ -87318,7 +87363,7 @@ index 6855dd9..8df8ac6 100644
  
      syslog(LOG_INFO, "[%s] started\n", TAG);
      return 0;
-@@ -399,10 +526,12 @@ static void lvgl_ui_do_cleanup(void)
+@@ -399,10 +540,12 @@ static void lvgl_ui_do_cleanup(void)
      s_state.screen_visible = false;
      s_state.prev_screen = NULL;
  
@@ -87331,7 +87376,7 @@ index 6855dd9..8df8ac6 100644
  
      s_state.chat_list = NULL;
      s_state.ptt_btn = NULL;
-@@ -426,6 +555,23 @@ static void stop_screen_async_cb(void* data)
+@@ -426,6 +569,23 @@ static void stop_screen_async_cb(void* data)
      sem_post(&s_stop_sem);
  }
  
@@ -87355,7 +87400,7 @@ index 6855dd9..8df8ac6 100644
  /* Stop from within the LVGL thread (e.g. close button callback).
   * Performs cleanup directly — no async scheduling needed. */
  void lvgl_ui_channel_stop_sync(void)
-@@ -441,6 +587,8 @@ void lvgl_ui_channel_stop_sync(void)
+@@ -441,6 +601,8 @@ void lvgl_ui_channel_stop_sync(void)
      pthread_mutex_destroy(&s_state.lock);
      s_state.initialized = false;
  
@@ -87364,7 +87409,7 @@ index 6855dd9..8df8ac6 100644
      syslog(LOG_INFO, "[%s] stopped\n", TAG);
  }
  
-@@ -493,6 +641,8 @@ void lvgl_ui_channel_stop(void)
+@@ -493,6 +655,8 @@ void lvgl_ui_channel_stop(void)
  
      s_state.initialized = false;
  
@@ -87373,7 +87418,7 @@ index 6855dd9..8df8ac6 100644
      syslog(LOG_INFO, "[%s] stopped\n", TAG);
  }
  
-@@ -511,6 +661,7 @@ static void show_screen_async_cb(void* data)
+@@ -511,6 +675,7 @@ static void show_screen_async_cb(void* data)
       * FreeType size handle is owned by the same thread that will
       * later rasterize glyphs.  Creating it from the main thread
       * (in init) causes FT_Err_Invalid_Size_Handle (0x55). */
@@ -87381,7 +87426,7 @@ index 6855dd9..8df8ac6 100644
      if (!s_state.font) {
          s_state.font = vg_font_create("MiSans-Medium", 18,
              LV_FREETYPE_FONT_STYLE_NORMAL);
-@@ -520,6 +671,7 @@ static void show_screen_async_cb(void* data)
+@@ -520,6 +685,7 @@ static void show_screen_async_cb(void* data)
              syslog(LOG_WARNING, "[%s] vg_font_create failed, keeping montserrat\n", TAG);
          }
      }
@@ -87389,7 +87434,7 @@ index 6855dd9..8df8ac6 100644
  
      syslog(LOG_INFO, "[%s] loading chat screen\n", TAG);
  
-@@ -542,82 +694,144 @@ void lvgl_ui_channel_show(void)
+@@ -542,82 +708,144 @@ void lvgl_ui_channel_show(void)
          return;
      }
  
@@ -87460,19 +87505,19 @@ index 6855dd9..8df8ac6 100644
 +        s_queue_head = (s_queue_head + 1) % UI_QUEUE_MAX;
 +        s_queue_count--;
 +    }
- 
--    lv_async_call(chat_view_add_message_async_cb, payload);
++
 +    slot = (s_queue_head + s_queue_count) % UI_QUEUE_MAX;
 +    s_queue[slot] = payload;
 +    s_queue_count++;
+ 
+-    lv_async_call(chat_view_add_message_async_cb, payload);
++    /* First line of any kind brings the chat screen up */
++    s_show_requested = true;
  
 -    /* TTS is blocking — run after scheduling the UI update */
 -    ret = voice_channel_speak(text);
 -    if (ret != 0) {
 -        syslog(LOG_ERR, "[%s] voice_channel_speak failed (rc=%d)\n", TAG, ret);
-+    /* First line of any kind brings the chat screen up */
-+    s_show_requested = true;
-+
 +    pthread_mutex_unlock(&s_queue_mtx);
 +
 +    if (speak) {
@@ -87523,17 +87568,17 @@ index 6855dd9..8df8ac6 100644
 +
 +    if (show && !s_state.screen_visible) {
 +        show_screen_async_cb(NULL);
-+    }
-+
-+    for (i = 0; i < n; i++) {
-+        chat_view_add_message(batch[i]->text, batch[i]->is_user);
-+        free(batch[i]);
-+        batch[i] = NULL;
      }
  
 -    chat_view_add_message(payload->text, payload->is_user);
 -    free(payload);
 -    payload = NULL;
++    for (i = 0; i < n; i++) {
++        chat_view_add_message(batch[i]->text, batch[i]->is_user);
++        free(batch[i]);
++        batch[i] = NULL;
++    }
++
 +    /* A line landing means recognition finished -- either the recognised
 +     * command itself or the answer to it -- so the "识别中..." indicator has
 +     * done its job and goes back to idle. */
@@ -87555,8 +87600,8 @@ index 6855dd9..8df8ac6 100644
 +     * exactly like one that was never heard at all -- which is the hardest
 +     * case to debug when it is the recogniser that is wrong. */
 +    ui_post(text, true, false);
- }
- 
++}
++
 +int lvgl_ui_channel_post(const char* text)
 +{
 +    /* Display only, no TTS. Used to mirror traffic that was addressed to
@@ -87564,8 +87609,8 @@ index 6855dd9..8df8ac6 100644
 +     * intended channel does with it and, since voice_channel_speak() is
 +     * blocking, hold up the outbound dispatcher on every message. */
 +    return ui_post(text, false, false);
-+}
-+
+ }
+ 
 +/* ── Async callback for LVGL thread ────────────────────────── */
 +
 +/* The lv_async_call() callback that used to live here is gone with the call
@@ -87575,7 +87620,21 @@ index 6855dd9..8df8ac6 100644
  /* ── Internal functions ───────────────────────────────────── */
  
  static void chat_view_add_message(const char* text, bool is_user)
-@@ -708,77 +922,25 @@ static void ptt_btn_event_cb(lv_event_t* e)
+@@ -695,7 +923,12 @@ static void ptt_btn_event_cb(lv_event_t* e)
+ {
+     lv_event_code_t code = lv_event_get_code(e);
+ 
+-    /* Single-click toggle: first click starts recording, second stops */
++    /* Single-click toggle: first click starts recording, second stops.
++     *
++     * Note what this means for the operator: the recording runs *between*
++     * the two clicks. Click, speak, click again -- a quick double-click
++     * captures the silence in between and nothing else, which is what the
++     * other end reports as "too short" or "nothing recognised". */
+     if (code != LV_EVENT_CLICKED) {
+         return;
+     }
+@@ -708,77 +941,25 @@ static void ptt_btn_event_cb(lv_event_t* e)
      }
  
      if (!s_state.is_recording) {

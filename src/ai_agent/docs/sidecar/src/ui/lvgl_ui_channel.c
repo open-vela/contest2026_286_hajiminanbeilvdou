@@ -476,8 +476,22 @@ int lvgl_ui_channel_start(void)
      * lv_timer_handler() and processes our widgets — nothing to do here.
      * Standalone, nobody would pump the loop, so run one ourselves. */
     if (s_state.lvgl_owned) {
-        if (pthread_create(&s_state.lvgl_thread, NULL, lvgl_event_loop, NULL)
-            != 0) {
+        /* Explicit stack size. This was passing NULL, so the thread got the
+         * default (AGENT_LVGL_UI_STACK was defined but never referenced) --
+         * and lv_timer_handler() walks the widget tree recursively, so the
+         * deepest screen is what decides how much is needed. Overflowing it
+         * smashes whatever the allocator put next door, which surfaces far
+         * away as corrupt mutex bookkeeping (sem_waitirq.c) rather than as
+         * anything pointing at the UI. */
+        pthread_attr_t attr;
+
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, AGENT_LVGL_UI_STACK);
+        int rc = pthread_create(&s_state.lvgl_thread, &attr, lvgl_event_loop,
+                                NULL);
+        pthread_attr_destroy(&attr);
+
+        if (rc != 0) {
             syslog(LOG_ERR, "[%s] failed to start LVGL event loop\n", TAG);
             s_state.running = false;
             return -EIO;
@@ -909,7 +923,12 @@ static void ptt_btn_event_cb(lv_event_t* e)
 {
     lv_event_code_t code = lv_event_get_code(e);
 
-    /* Single-click toggle: first click starts recording, second stops */
+    /* Single-click toggle: first click starts recording, second stops.
+     *
+     * Note what this means for the operator: the recording runs *between*
+     * the two clicks. Click, speak, click again -- a quick double-click
+     * captures the silence in between and nothing else, which is what the
+     * other end reports as "too short" or "nothing recognised". */
     if (code != LV_EVENT_CLICKED) {
         return;
     }

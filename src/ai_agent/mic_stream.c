@@ -23,6 +23,7 @@
 #include "channels/mic_stream.h"
 #include "channels/ws_server.h"
 #include "agent_compat.h"
+#include "agent_config.h"
 
 #include "sf32lb_audcodec.h"
 
@@ -192,7 +193,7 @@ int mic_stream_start(const char* chat_id, int samples)
 
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr, 4096);
+    pthread_attr_setstacksize(&attr, AGENT_MIC_STREAM_STACK);
 
     int ret = pthread_create(&s_thread, &attr, mic_stream_thread, NULL);
     pthread_attr_destroy(&attr);
