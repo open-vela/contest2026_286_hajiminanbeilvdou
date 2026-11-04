@@ -53,6 +53,7 @@
 /* Null-modem link (direct wire to a host pppd server): no AT dialing,
  * the PPP peer is already on the wire.  NULL scripts skip chat entirely.
  */
+
 static FAR const char *connect_script = NULL;
 static FAR const char *disconnect_script = NULL;
 
@@ -71,14 +72,15 @@ static FAR const char *disconnect_script = NULL;
 
 int main(int argc, char *argv[])
 {
+  /* The board registers the console UART only as /dev/console (the ttySx
+   * loop in sifli_uart.c explicitly skips it), so that is the line that
+   * actually carries the CH340 link the peer is on.
+   */
+
   const struct pppd_settings_s pppd_settings =
   {
     .disconnect_script = disconnect_script,
     .connect_script = connect_script,
-    /* The board registers the console UART only as /dev/console (the ttySx
-     * loop in sifli_uart.c explicitly skips it), so that is the line that
-     * actually carries the CH340 link the peer is on.
-     */
     .ttyname = "/dev/console",
     .local_ip = { .s_addr = htonl(PPP_LOCAL_IP) },
 #ifdef CONFIG_NETUTILS_PPPD_PAP

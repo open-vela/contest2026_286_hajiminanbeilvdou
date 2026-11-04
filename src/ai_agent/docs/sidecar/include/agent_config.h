@@ -319,6 +319,32 @@
  * no headroom for either. */
 #define AGENT_MIC_STREAM_STACK (8 * 1024)
 
+/* ── Device health ─────────────────────────────────────────── */
+#ifdef CONFIG_AI_AGENT_HEALTH_INTERVAL_MS
+#define AGENT_HEALTH_INTERVAL_MS CONFIG_AI_AGENT_HEALTH_INTERVAL_MS
+#else
+#define AGENT_HEALTH_INTERVAL_MS 5000
+#endif
+
+#ifdef CONFIG_AI_AGENT_HEALTH_STACKSIZE
+#define AGENT_HEALTH_STACK CONFIG_AI_AGENT_HEALTH_STACKSIZE
+#else
+#define AGENT_HEALTH_STACK (16 * 1024)
+#endif
+
+/* NuttX priorities count down; 65 leaves the sampler below the work
+ * queues and above the idle-time threads, so it cannot starve anything.
+ */
+#define AGENT_HEALTH_PRIO 65
+
+/* No rules run until the system has settled. */
+#define AGENT_HEALTH_GRACE_S 120
+
+/* After this many health-initiated resets without a host ack, stay up and
+ * only report: a reset loop is worse than a degraded device.
+ */
+#define AGENT_HEALTH_AUTORESET_MAX 3
+
 /* ── LVGL UI Channel ───────────────────────────────────────── */
 #ifdef CONFIG_AI_AGENT_LVGL_UI
 /* Driven by the deepest widget tree lv_timer_handler() has to walk, not by

@@ -20,7 +20,7 @@
 
 /* Stream the on-board microphone to a WebSocket client.
  *
- * The device captures 8 kHz / 16-bit / mono PCM, compresses it to G.711
+ * The device captures 8.46 kHz / 16-bit / mono PCM, compresses it to G.711
  * mu-law and pushes it as binary WebSocket frames; the far end is expected to
  * do the recognition. Keeping ASR off the device is deliberate -- the same
  * audio then feeds whatever recogniser the host has, including ones that
@@ -63,3 +63,5 @@
 int mic_stream_start(const char* chat_id, int samples);
 int mic_stream_stop(void);
 bool mic_stream_is_running(void);
+/* Runtime capture gain (-60..30 dB); returns -EINVAL when the ADC is closed. */
+int mic_stream_set_volume(int volume_db);

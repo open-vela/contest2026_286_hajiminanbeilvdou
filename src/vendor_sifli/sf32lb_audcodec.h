@@ -129,6 +129,17 @@ int sf32lb_audcodec_open_ex(uint32_t sample_rate,
 #define SF32LB_AUDIO_DEFAULT_VOLUME (30)
 
 /****************************************************************************
+ * Name: sf32lb_audcodec_set_volume
+ *
+ * Description:
+ *   Change the capture gain while the ADC is already running.  Used by the
+ *   watch UI settings page; returns -EINVAL when capture is closed.
+ *
+ ****************************************************************************/
+
+int sf32lb_audcodec_set_volume(int volume_db);
+
+/****************************************************************************
  * Name: sf32lb_audcodec_set_clk
  *
  * Description:

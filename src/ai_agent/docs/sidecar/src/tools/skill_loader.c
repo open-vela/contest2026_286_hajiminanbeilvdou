@@ -197,17 +197,21 @@ static const char *TAG = "skills";
 
 #define BUILTIN_DEVICE_GUARDIAN \
     "# Device Guardian\n\n" \
-    "Inspect this device's live health with run_shell telemetry and report it concisely in the user's language (Chinese for zh users).\n\n" \
+    "Inspect this device's live health with the get_health tool and report it concisely in the user's language (Chinese for zh users).\n\n" \
     "## When to use\n" \
     "When woken by a scheduled task (wake_agent cron job) to check the device, " \
     "or when the user asks about device health, memory, storage, network, or uptime.\n\n" \
     "## How to use\n" \
-    "Collect telemetry with run_shell, one command per call:\n" \
-    "1. run_shell command=\"free\"   - heap usage (columns: total used free ...)\n" \
-    "2. run_shell command=\"ps\"     - task list; confirms pppd/agent are alive\n" \
-    "3. run_shell command=\"df\"     - filesystem usage\n" \
-    "4. run_shell command=\"uptime\" - uptime\n" \
-    "Only run the commands you need; skip any that fail.\n\n" \
+    "1. get_health - one structured snapshot: status, heap, tasks, network, "\
+    "WebSocket clients, microphone, cron, LLM and the active issues. It is "\
+    "cheaper and more accurate than guessing from shell output.\n" \
+    "2. Only if get_health is unavailable or you need storage, fall back to "\
+    "run_shell, one command per call:\n" \
+    "   run_shell command=\"free\"   - heap usage (columns: total used free ...)\n" \
+    "   run_shell command=\"ps\"     - task list; confirms pppd/agent are alive\n" \
+    "   run_shell command=\"df\"     - filesystem usage\n" \
+    "   run_shell command=\"uptime\" - uptime\n" \
+    "Skip any command that fails.\n\n" \
     "## Rules\n" \
     "- Free heap below 1 MB is critical, below 2 MB is a warning.\n" \
     "- A filesystem above 85% used is a warning.\n" \
@@ -253,8 +257,8 @@ static const char *TAG = "skills";
     "turn, in that order, and read each result before choosing the next.\n\n" \
     "| The user says | Call | Then |\n" \
     "|---|---|---|\n" \
-    "| 巡检 / 检查一下设备 / 体检 | run_shell: free, then ps, then df, then uptime | report in device-guardian format |\n" \
-    "| 内存 / 存储 / 空间 / 还剩多少 | run_shell: free, then df | one line with the real numbers |\n" \
+    "| 巡检 / 检查一下设备 / 体检 | get_health | report in device-guardian format |\n" \
+    "| 内存 / 存储 / 空间 / 还剩多少 | get_health for heap, then run_shell: df | one line with the real numbers |\n" \
     "| 任务 / 进程 / 运行着什么 | run_shell: ps | how many tasks, and whether pppd is alive |\n" \
     "| 几点 / 现在几点 / 时间 | get_current_time | the time it returned |\n" \
     "| 在屏幕上显示<X> | no tool | reply with exactly <X> and nothing else |\n" \

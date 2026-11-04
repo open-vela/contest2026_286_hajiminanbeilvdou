@@ -23,6 +23,7 @@
 #pragma once
 
 #include "agent_compat.h"
+#include <stdbool.h>
 #include <stddef.h>
 #include <time.h>
 
@@ -35,6 +36,14 @@
  * which disturbs timers that are already armed.
  */
 time_t tool_get_time_offset(void);
+
+/** True once a network time has been obtained. Lets the UI distinguish
+ *  "offset is zero because the clock is right" from "not synced yet". */
+bool tool_get_time_is_synced(void);
+
+/** time() plus the network correction (UTC epoch), safe to call from the
+ *  LVGL thread. */
+time_t tool_get_time_now(void);
 
 /**
  * Execute get_current_time tool.

@@ -8,7 +8,8 @@ command, and hands that command back to the agent.
     device MEMS mic
       -> AUDCODEC ADC capture (sf32lb_audcodec.c)
       -> binary WebSocket frames @16 kHz / 16-bit mono
-      -> this script: energy VAD -> sherpa-onnx Paraformer (zh, offline)
+      -> this script: energy VAD -> sherpa-onnx offline ASR
+         (FireRedASR2-AED by default when downloaded, Paraformer fallback)
       -> transcript -> wake phrase -> understanding step -> command
       -> {"type":"message","content":...} back to the device
       -> agent executes (cron tasks, telemetry, screen, ...)
@@ -34,8 +35,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import difflib
 import json
+import math
 import os
+import re
 import sys
 import time
 import traceback
@@ -49,13 +53,12 @@ import websockets
 # Audio / protocol constants -- must match the device side
 # ---------------------------------------------------------------------------
 
-# The device compands to G.711 mu-law at 5801 Hz, one byte per sample. The
-# rate is what the PPP link can carry (~6 KB/s of payload), not what the
-# recogniser would prefer; going wider does not degrade gracefully -- the
-# capture path drops samples and the gaps alias into something no recogniser
-# can read. The real rate arrives in the stream's audio_format frame; this is
-# only the fallback.
-DEVICE_RATE = 5801
+# The device compands to G.711 mu-law at 8462 Hz, one byte per sample. A 60 s
+# soak at this rate sustained 8.40 KB/s with zero ping loss; a 17.4 kHz /
+# 4-bit ADPCM trial showed the practical link ceiling is ~8.0-8.4 KB/s, so
+# this is the widest rate that stays reliable. The real rate arrives in the
+# stream's audio_format frame; this is only the fallback.
+DEVICE_RATE = 8462
 
 # The device sends large frames (throughput), but endpointing wants small
 # ones. Decouple the two here: whatever arrives is sliced back into fixed
@@ -78,6 +81,51 @@ MODEL_DIR = os.path.expanduser("~/voice_models")
 MODEL_ONNX = os.path.join(MODEL_DIR, "model.int8.onnx")
 MODEL_TOKENS = os.path.join(MODEL_DIR, "tokens.txt")
 
+# Available offline recognisers.  The first entry is the small model that
+# shipped with the demo; the larger ones are drop-in upgrades for accuracy
+# (FireRedASR2-AED and Qwen3-ASR are the strongest, at a latency cost).
+ASR_MODELS = {
+    "paraformer-small": {
+        "kind": "paraformer", "dir": MODEL_DIR,
+        "files": ("model.int8.onnx", "tokens.txt"),
+    },
+    "paraformer-large": {
+        "kind": "paraformer", "dir": "~/voice_models/paraformer-large",
+        "files": ("model.int8.onnx", "tokens.txt"),
+    },
+    "sensevoice": {
+        "kind": "sense_voice", "dir": "~/voice_models/sensevoice-2025",
+        "files": ("model.int8.onnx", "tokens.txt"),
+    },
+    "dolphin-small": {
+        "kind": "dolphin", "dir": "~/voice_models/dolphin-small",
+        "files": ("model.int8.onnx", "tokens.txt"),
+    },
+    "firered-aed": {
+        "kind": "fire_red_aed", "dir": "~/voice_models/firered2-aed",
+        "files": ("encoder.int8.onnx", "decoder.int8.onnx", "tokens.txt"),
+    },
+    "firered-ctc": {
+        "kind": "fire_red_ctc", "dir": "~/voice_models/firered2-ctc",
+        "files": ("model.int8.onnx", "tokens.txt"),
+    },
+    "qwen3-0.6b": {
+        "kind": "qwen3", "dir": "~/voice_models/qwen3-0.6b",
+        "files": ("conv_frontend.onnx", "encoder.int8.onnx",
+                  "decoder.int8.onnx", "tokenizer.json"),
+    },
+}
+
+
+def asr_model_paths(name: str) -> dict[str, str]:
+    spec = ASR_MODELS[name]
+    base = os.path.expanduser(spec["dir"])
+    return {f: os.path.join(base, f) for f in spec["files"]}
+
+
+def asr_model_files(name: str) -> tuple[str, ...]:
+    return tuple(asr_model_paths(name).values())
+
 
 def ulaw_decode(data: bytes) -> np.ndarray:
     """G.711 mu-law -> int16, matching mic_ulaw_encode() on the device."""
@@ -87,6 +135,113 @@ def ulaw_decode(data: bytes) -> np.ndarray:
     mantissa = u & 0x0F
     sample = (((mantissa << 3) + 0x84) << exponent) - 0x84
     return np.where(sign != 0, -sample, sample).astype(np.int16)
+
+
+IMA_STEP_TABLE = (
+    7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31,
+    34, 37, 41, 45, 50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130, 143,
+    157, 173, 190, 209, 230, 253, 279, 307, 337, 371, 408, 449, 494, 544,
+    598, 658, 724, 796, 876, 963, 1060, 1166, 1282, 1411, 1552, 1707,
+    1878, 2066, 2272, 2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358,
+    5894, 6484, 7132, 7845, 8630, 9493, 10442, 11487, 12635, 13899, 15289,
+    16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767,
+)
+
+IMA_INDEX_TABLE = (
+    -1, -1, -1, -1, 2, 4, 6, 8,
+    -1, -1, -1, -1, 2, 4, 6, 8,
+)
+
+
+class ImaAdpcmDecoder:
+    """Stateful 4-bit IMA ADPCM decoder (low nibble first).
+
+    The device carries an odd sample's nibble into the next WebSocket frame,
+    so the decoder state must live across frames, not be recreated per frame.
+    """
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self) -> None:
+        self.prev = 0
+        self.index = 0
+
+    def decode(self, data: bytes) -> bytes:
+        out = bytearray(len(data) * 4)   # 2 samples/byte * 2 bytes/sample
+        pos = 0
+        prev = self.prev
+        index = self.index
+
+        for byte in data:
+            for nib in (byte & 0x0F, byte >> 4):
+                step = IMA_STEP_TABLE[index]
+                diff = step >> 3
+                if nib & 4:
+                    diff += step
+                if nib & 2:
+                    diff += step >> 1
+                if nib & 1:
+                    diff += step >> 2
+                if nib & 8:
+                    prev -= diff
+                else:
+                    prev += diff
+                if prev < -32768:
+                    prev = -32768
+                elif prev > 32767:
+                    prev = 32767
+
+                index += IMA_INDEX_TABLE[nib]
+                if index < 0:
+                    index = 0
+                elif index > 88:
+                    index = 88
+
+                sample = prev & 0xFFFF
+                out[pos] = sample & 0xFF
+                out[pos + 1] = sample >> 8
+                pos += 2
+
+        self.prev = prev
+        self.index = index
+        return bytes(out)
+
+
+class DcBlocker:
+    """One-pole high-pass (~80 Hz) with state kept across audio frames.
+
+    The ADC has a DC offset and the board picks up desk/air-conditioner
+    rumble. Neither carries speech, but both raise the RMS the VAD uses and
+    can bias the recogniser's front end. Cutting below 80 Hz is inaudible
+    for speech and removes the slow drift.
+    """
+
+    def __init__(self, rate: int, cutoff: float = 80.0):
+        self.alpha = math.exp(-2.0 * math.pi * cutoff / float(max(rate, 1)))
+        self.reset()
+
+    def reset(self) -> None:
+        self._x1 = 0.0
+        self._y1 = 0.0
+
+    def process(self, pcm: bytes) -> bytes:
+        if len(pcm) < 2:
+            return pcm
+        x = np.frombuffer(pcm, dtype=np.int16).astype(np.float64)
+        y = np.empty(len(x), dtype=np.float64)
+        alpha = self.alpha
+        x1 = self._x1
+        y1 = self._y1
+        for i in range(len(x)):
+            xi = float(x[i])
+            yi = alpha * (y1 + xi - x1)
+            y[i] = yi
+            x1 = xi
+            y1 = yi
+        self._x1 = x1
+        self._y1 = y1
+        return np.clip(np.round(y), -32768, 32767).astype(np.int16).tobytes()
 
 
 def resample(x: np.ndarray, src: int, dst: int) -> np.ndarray:
@@ -123,18 +278,82 @@ def resample(x: np.ndarray, src: int, dst: int) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 class Recognizer:
-    """Thin wrapper over the sherpa-onnx Paraformer Chinese model."""
+    """Thin wrapper over the selected sherpa-onnx offline ASR model.
 
-    def __init__(self, onnx: str = MODEL_ONNX, tokens: str = MODEL_TOKENS):
-        self._rec = sherpa_onnx.OfflineRecognizer.from_paraformer(
-            paraformer=onnx,
-            tokens=tokens,
-            num_threads=2,
-            sample_rate=MODEL_RATE,
-            feature_dim=80,
-            decoding_method="greedy_search",
-            debug=False,
-        )
+    All models are fed at MODEL_RATE; the device rate is resampled by sherpa
+    itself.  Larger models (FireRedASR2-AED, Qwen3-ASR) trade latency for
+    accuracy but load through the same interface.
+    """
+
+    def __init__(self, model: str = "paraformer-small",
+                 num_threads: int | None = None):
+        if model not in ASR_MODELS:
+            raise ValueError("unknown ASR model %r (choose from %s)"
+                             % (model, ", ".join(sorted(ASR_MODELS))))
+        self.model = model
+        paths = asr_model_paths(model)
+        kind = ASR_MODELS[model]["kind"]
+        threads = num_threads or int(os.environ.get("VOICE_ASR_THREADS", "4"))
+        print("[asr] model=%s threads=%d" % (model, threads), flush=True)
+        common = dict(num_threads=threads, debug=False, provider="cpu")
+
+        if kind == "paraformer":
+            self._rec = sherpa_onnx.OfflineRecognizer.from_paraformer(
+                paraformer=paths["model.int8.onnx"],
+                tokens=paths["tokens.txt"],
+                sample_rate=MODEL_RATE,
+                feature_dim=80,
+                decoding_method="greedy_search",
+                **common,
+            )
+        elif kind == "sense_voice":
+            self._rec = sherpa_onnx.OfflineRecognizer.from_sense_voice(
+                model=paths["model.int8.onnx"],
+                tokens=paths["tokens.txt"],
+                sample_rate=MODEL_RATE,
+                feature_dim=80,
+                decoding_method="greedy_search",
+                use_itn=True,
+                language="zh",
+                **common,
+            )
+        elif kind == "dolphin":
+            self._rec = sherpa_onnx.OfflineRecognizer.from_dolphin_ctc(
+                model=paths["model.int8.onnx"],
+                tokens=paths["tokens.txt"],
+                sample_rate=MODEL_RATE,
+                feature_dim=80,
+                decoding_method="greedy_search",
+                **common,
+            )
+        elif kind == "fire_red_aed":
+            self._rec = sherpa_onnx.OfflineRecognizer.from_fire_red_asr(
+                encoder=paths["encoder.int8.onnx"],
+                decoder=paths["decoder.int8.onnx"],
+                tokens=paths["tokens.txt"],
+                decoding_method="greedy_search",
+                **common,
+            )
+        elif kind == "fire_red_ctc":
+            self._rec = sherpa_onnx.OfflineRecognizer.from_fire_red_asr_ctc(
+                model=paths["model.int8.onnx"],
+                tokens=paths["tokens.txt"],
+                decoding_method="greedy_search",
+                **common,
+            )
+        elif kind == "qwen3":
+            self._rec = sherpa_onnx.OfflineRecognizer.from_qwen3_asr(
+                conv_frontend=paths["conv_frontend.onnx"],
+                encoder=paths["encoder.int8.onnx"],
+                decoder=paths["decoder.int8.onnx"],
+                tokenizer=paths["tokenizer.json"],
+                sample_rate=MODEL_RATE,
+                feature_dim=128,
+                decoding_method="greedy_search",
+                **common,
+            )
+        else:
+            raise ValueError("unsupported ASR model kind %r" % kind)
 
     def transcribe(self, pcm: bytes, src_rate: int = DEVICE_RATE) -> str:
         if len(pcm) < 2:
@@ -176,17 +395,22 @@ class Segmenter:
     # The bridge slices incoming frames into fixed sub-frames before they get
     # here, so these are real times regardless of the device's frame size.
     PREROLL_MS = 300          # kept before the trigger point
-    TRAIL_SILENCE_MS = 700    # silence that ends an utterance
+    # 700 ms cut "你好openvela" away from the command whenever the speaker
+    # paused for a breath. A raw 90 s capture showed the same sentence split
+    # into "你好 OPEN VLOG" + "现在" + "几点了"; 1500 ms keeps the whole
+    # command together at the cost of one extra second of response latency.
+    TRAIL_SILENCE_MS = 1500   # silence that ends an utterance
     MIN_SPEECH_MS = 200       # ignore blips shorter than this
     MAX_UTTERANCE_MS = 15000  # hard stop
     CALIBRATION_MS = 600      # measured before the first decision
 
     # 2.5 was too strict: the on-board microphone sits close to the desk and
     # picks up a fair amount of broadband noise, so the gap between the floor
-    # and a spoken phrase is only about 3x. With the trigger set that high,
-    # inter-syllable dips fell back under it and utterances were cut off after
-    # a few hundred milliseconds.
-    HEADROOM = 1.8
+    # and a spoken phrase is only about 3x. 1.5 (down from 1.8) was validated
+    # on the same raw capture: quiet syllables at ~3.3k RMS were being missed
+    # with 1.8, and the recogniser then saw only "设备的内" instead of the
+    # full "请帮我看一下设备的内存".
+    HEADROOM = 1.5
 
     def __init__(self, rate: int = DEVICE_RATE, thresh: int = 300,
                  fixed_thresh: bool = False):
@@ -309,23 +533,52 @@ class Segmenter:
 # Rules used when no LLM endpoint is configured. Order matters: the first
 # match wins, so put the more specific intents first.
 RULES: list[tuple[tuple[str, ...], str]] = [
-    (("巡检", "检查一下", "体检"),
+    (("巡检", "巡查", "寻检", "巡捡", "设备状态", "检查设备",
+      "检查一下设备", "体检"),
      "立即巡检设备，采集内存、任务数和存储数据"),
+    # Cancel must come before the periodic rule: "取消定时任务" contains
+    # "定时" and would otherwise be routed to "set another timer".
+    (("停止", "取消", "别", "不用了", "取消掉", "关掉", "撤销"),
+     "取消所有定时任务"),
     (("每隔", "每", "定时", "周期", "经常"),
      "请每2分钟巡检一次设备"),
-    (("停止", "取消", "别", "不用了", "取消掉"),
-     "取消所有定时任务"),
-    (("屏幕", "显示", "给我看"),
+    (("屏幕", "显示", "上屏", "写屏", "给我看"),
      "在屏幕上显示一句话：你好，我是随身AI管家"),
-    (("内存", "存储", "空间", "还剩下"),
+    (("内存", "存储", "空间", "还剩下", "运存", "记忆"),
      "看一下设备当前的内存和存储使用情况"),
-    (("任务", "进程", "运行着什么", "跑着什么"),
+    (("任务", "进程", "线程", "运行着什么", "跑着什么"),
      "看看设备上正在运行哪些任务"),
-    (("时间", "几点", "多久"),
+    (("时间", "几点", "多久", "报时"),
      "现在几点了"),
-    (("你好", "在吗", "嗨"),
+    (("介绍", "你是谁", "你能做什么", "会什么"),
+     "你好，介绍一下你自己"),
+    (("你好", "您好", "在吗", "嗨"),
      "你好，介绍一下你自己"),
 ]
+
+_CN_DIGITS = {
+    "零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+    "五": 5, "六": 6, "七": 7, "八": 8, "九": 9,
+}
+
+
+def _parse_cn_number(text: str) -> int:
+    """Parse the small Chinese/Arabic numbers used in 'every N minutes'."""
+    text = text.strip()
+    if not text:
+        return 0
+    if text.isdigit():
+        return int(text)
+    if "百" in text:
+        left, _, right = text.partition("百")
+        hundreds = _CN_DIGITS.get(left, 1) if left else 1
+        return hundreds * 100 + (_parse_cn_number(right) if right else 0)
+    if "十" in text:
+        left, _, right = text.partition("十")
+        tens = _CN_DIGITS.get(left, 1) if left else 1
+        ones = _CN_DIGITS.get(right, 0) if right else 0
+        return tens * 10 + ones
+    return _CN_DIGITS.get(text, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -350,12 +603,34 @@ WAKE_PHRASE = "你好openvela"
 # other: after the anchor, at least one ASCII letter. That is enough to keep
 # an ordinary "你好，介绍一下你自己" -- or a burst of room noise -- from
 # waking the device, while accepting every mangling seen in practice.
-WAKE_ANCHOR = "你好"
+WAKE_ANCHORS = ("你好", "您好", "尼好")
 
 # How long after the wake phrase a command is still accepted. Long enough to
 # say the two halves in separate breaths, short enough that walking away does
 # not leave the microphone live for whoever speaks next.
 WAKE_ARM_S = 8.0
+
+
+# Recurring ASR confusions on this band-limited link. Applied after
+# normalisation, so they also make the wake tail contain a Latin word.
+_ASR_FIXES = (
+    ("寻检", "巡检"), ("巡捡", "巡检"), ("寻见", "巡检"), ("巡查", "巡检"),
+    ("内层", "内存"), ("内村", "内存"), ("内纯", "内存"),
+    ("定式", "定时"), ("定事", "定时"),
+    ("任物", "任务"),
+    ("平幕", "屏幕"), ("屏木", "屏幕"),
+    ("记意", "记忆"), ("记玉", "记忆"), ("记一", "记忆"),
+    # Wake-brand manglings measured on the 5.8 kHz stream; kept because the
+    # recogniser still produces them at 8.46 kHz.
+    ("openrenline", "openvela"), ("openrula", "openvela"),
+    ("oppovia", "openvela"), ("okvela", "openvela"),
+    ("openviila", "openvela"), ("openvilla", "openvela"),
+    ("openvilller", "openvela"), ("openvillla", "openvela"),
+    ("openvila", "openvela"), ("openvlog", "openvela"),
+    ("openvlo", "openvela"),
+    ("欧朋", "openvela"), ("欧本", "openvela"),
+    ("欧维拉", "openvela"), ("欧文拉", "openvela"),
+)
 
 
 def normalize_speech(text: str) -> str:
@@ -364,11 +639,16 @@ def normalize_speech(text: str) -> str:
     The recogniser will not spell a Latin brand the same way twice, and it
     sprinkles punctuation through Chinese, so "你好，openvela" and
     "你好 open vela" have to collapse to the same string before comparing.
+    Known one-character slips are folded too; otherwise the intent rules
+    never see the word they are looking for.
     """
-    return "".join(ch for ch in text.lower() if ch.isalnum())
+    norm = "".join(ch for ch in text.lower() if ch.isalnum())
+    for wrong, right in _ASR_FIXES:
+        norm = norm.replace(wrong, right)
+    return norm
 
 
-WAKE_KEY = normalize_speech(WAKE_ANCHOR)
+WAKE_KEYS = tuple(normalize_speech(a) for a in WAKE_ANCHORS)
 
 
 def split_wake(text: str) -> tuple[bool, str]:
@@ -377,16 +657,24 @@ def split_wake(text: str) -> tuple[bool, str]:
     The tail matters: "你好openvela，现在几点了" is a wake word and a command
     in one breath, and the speaker should not have to say it twice.
 
-    See WAKE_ANCHOR above for why the tail is only checked for the presence
+    See WAKE_ANCHORS above for why the tail is only checked for the presence
     of a Latin letter rather than matched against the brand.
     """
     norm = normalize_speech(text)
-    if not norm.startswith(WAKE_KEY):
-        return False, ""
-    tail = norm[len(WAKE_KEY):]
-    if not any(ch.isascii() and ch.isalpha() for ch in tail):
-        return False, ""
-    return True, tail
+
+    # The brand is distinctive enough that its presence anywhere is a wake.
+    # FireRed frequently drops the leading "你" ("好 OPEN VILLA...") or
+    # returns the brand alone; requiring a fixed prefix would miss those.
+    pos = norm.find("openvela")
+    if pos >= 0:
+        return True, norm[pos + len("openvela"):]
+
+    for key in WAKE_KEYS:
+        if norm.startswith(key):
+            tail = norm[len(key):]
+            if any(ch.isascii() and ch.isalpha() for ch in tail):
+                return True, tail
+    return False, ""
 
 
 def understand(text: str, llm_url: str | None = None) -> str:
@@ -402,9 +690,39 @@ def understand(text: str, llm_url: str | None = None) -> str:
         except Exception as exc:                     # noqa: BLE001
             print("  [llm] endpoint failed (%s), falling back to rules" % exc)
 
+    text_n = normalize_speech(text)
+
+    # "每五分钟" must keep the number; the generic 每/定时 rule below would
+    # otherwise silently turn every interval into two minutes.
+    m = re.search(r"每(?:隔)?([0-9零一二两三四五六七八九十百]+)(?:分钟|分)",
+                  text_n)
+    if m:
+        minutes = _parse_cn_number(m.group(1))
+        if 1 <= minutes <= 60:
+            return "请每%d分钟巡检一次设备" % minutes
+
     for keys, command in RULES:
-        if any(k in text for k in keys):
+        if any(k in text_n for k in keys):
             return command
+
+    # Short transcripts are the ones ASR mangles by one character ("巡捡",
+    # "记意"). Accept a close match for those; longer free-form text still
+    # falls through to the LLM or is dropped, so room noise cannot become a
+    # command by accident.
+    if len(text_n) <= 8:
+        best_score = 0.0
+        best_command = ""
+        for keys, command in RULES:
+            for key in keys:
+                key_n = normalize_speech(key)
+                if not key_n:
+                    continue
+                score = difflib.SequenceMatcher(None, text_n, key_n).ratio()
+                if score > best_score:
+                    best_score, best_command = score, command
+        if best_score >= 0.72:
+            print("  [rules] fuzzy %.2f -> %s" % (best_score, best_command))
+            return best_command
 
     # Nothing matched, so this is not a command and the caller should drop it.
     #
@@ -451,11 +769,16 @@ def _understand_llm(text: str, llm_url: str) -> str:
 class Bridge:
     def __init__(self, args):
         self.args = args
-        self.asr = Recognizer()
+        self.asr = Recognizer(args.asr_model, args.asr_threads)
         self.seg = Segmenter(rate=DEVICE_RATE, thresh=args.thresh,
                              fixed_thresh=args.no_vad)
+        print("[vad] trail=%dms headroom=%.1f"
+              % (self.seg.TRAIL_SILENCE_MS, self.seg.HEADROOM), flush=True)
         self.saved = 0
         self.rate = None          # set from the device's audio_format frame
+        self.codec = "ulaw"       # updated by audio_format; ima_adpcm is 17.4 kHz
+        self.adpcm = ImaAdpcmDecoder()
+        self.dc = DcBlocker(DEVICE_RATE)
         self._carry = b""         # partial sub-frame left over between frames
 
         # Push-to-talk, driven by the button on the watch. While it is on,
@@ -479,8 +802,15 @@ class Bridge:
         self._mic_paused = False
         self._resume_mic = False
 
+    def decode_audio(self, data: bytes) -> bytes:
+        if self.codec == "ima_adpcm":
+            return self.adpcm.decode(data)
+        return ulaw_decode(data).tobytes()
+
     def _feed(self, ws, pcm: bytes, pending: list) -> None:
         """Slice one received frame into fixed sub-frames for the segmenter."""
+        pcm = self.dc.process(pcm)
+
         if self._ptt_on:
             # Push-to-talk owns the microphone while it is pressed. Running
             # the segmenter as well would cut the sentence at the first pause
@@ -559,10 +889,10 @@ class Bridge:
         not available: it is driven by the same ptt frames the button sends,
         and the device broadcasts those to every client, so the bridge would
         receive its own frame and believe the physical button had been pressed.
-        A message is the only thing that reaches the UI queue.
+        A ui_notice frame reaches the UI queue without entering the agent.
         """
         try:
-            await ws.send(json.dumps({"type": "message",
+            await ws.send(json.dumps({"type": "ui_notice",
                                       "content": "（已唤醒，请说指令）"}))
             print("  [wake] 已在屏幕上提示")
         except Exception as exc:                     # noqa: BLE001
@@ -578,11 +908,11 @@ class Bridge:
         used to leave the screen on "识别中..." with push-to-talk dead until
         the board was reset.
 
-        Sending anything at all unlatches it, and saying so beats freezing
-        with no explanation.
+        A ui_notice unlatches it without starting an agent turn, and saying
+        so beats freezing with no explanation.
         """
         try:
-            await ws.send(json.dumps({"type": "message",
+            await ws.send(json.dumps({"type": "ui_notice",
                                       "content": "（没听清，请再说一次）"}))
             print("  [cmd] notified the device that nothing was understood")
         except Exception as exc:                     # noqa: BLE001
@@ -705,10 +1035,11 @@ class Bridge:
             # while this bridge was down leaves push-to-talk dead until the
             # board is reset, and nothing on this side can tell that it did.
             #
-            # Any reply unlatches it, so ask for one on connect. That is what
-            # makes the chain recover on its own after a reconnect instead of
-            # needing someone to power-cycle the board.
-            await ws.send(json.dumps({"type": "message",
+            # A ui_notice unlatches it without entering the agent loop, so ask
+            # for one on connect. That is what makes the chain recover on its
+            # own after a reconnect instead of needing someone to power-cycle
+            # the board.
+            await ws.send(json.dumps({"type": "ui_notice",
                                       "content": "（语音链路已连接）"}))
 
             # Fresh segmenter state: half a sentence from the previous
@@ -769,10 +1100,9 @@ class Bridge:
                     if isinstance(msg, (bytes, bytearray)):
                         pcm_total += len(msg)
                         last_data = now
-                        # One mu-law byte per sample on the wire; expand to
-                        # 16-bit before anything looks at levels or timing.
-                        self._feed(ws, ulaw_decode(bytes(msg)).tobytes(),
-                                   pending)
+                        # Decode according to audio_format; both codecs end up
+                        # as 16-bit mono PCM before levels or timing are used.
+                        self._feed(ws, self.decode_audio(bytes(msg)), pending)
                     else:
                         self._on_text(msg)
 
@@ -821,6 +1151,26 @@ class Bridge:
         kind = data.get("type", "?")
         content = data.get("content", "")
 
+        if kind == "status":
+            # Intermediate progress ("working..."). The agent has not
+            # answered yet, so the uplink must stay paused.
+            print("  [dev] status: %s" % content)
+            return
+
+        if kind == "health":
+            # Device-side health transition or periodic report. It is not
+            # speech and must not enter the recognition path; printing it
+            # is enough for the watchdog log and for whoever is watching.
+            issue = data.get("issue", "none")
+            detail = data.get("detail", "")
+            line = "  [health] %s" % data.get("status", "?")
+            if issue and issue != "none":
+                line += " -- %s" % issue
+                if detail:
+                    line += " (%s)" % detail
+            print(line)
+            return
+
         if kind == "response" and self._mic_paused:
             # The agent has answered, so the wire is free again. Actually
             # sending is the caller's job: this runs synchronously from the
@@ -829,12 +1179,19 @@ class Bridge:
 
         if kind == "audio_format":
             self.rate = int(data.get("rate", DEVICE_RATE))
+            codec = data.get("codec")
+            if codec:
+                self.codec = codec
+            if self.codec == "ima_adpcm":
+                self.adpcm.reset()
             print("  [dev] stream format: %s %d Hz %d ch"
-                  % (data.get("codec", "?"), self.rate,
+                  % (codec or "?", self.rate,
                      int(data.get("channels", 1))))
-            if data.get("codec") not in (None, "ulaw"):
+            if codec not in (None, "ulaw", "ima_adpcm"):
                 print("  [dev] WARNING: unexpected codec; decoding as ulaw anyway")
+                self.codec = "ulaw"
             self.seg.set_rate(self.rate)
+            self.dc = DcBlocker(self.rate)
             return
 
         if kind == "ptt":
@@ -872,6 +1229,16 @@ class Bridge:
 
 # ---------------------------------------------------------------------------
 
+def default_asr_model() -> str:
+    """Prefer the high-accuracy model when it has been downloaded."""
+    env = os.environ.get("VOICE_ASR_MODEL")
+    if env:
+        return env
+    if all(os.path.exists(f) for f in asr_model_files("firered-aed")):
+        return "firered-aed"
+    return "paraformer-small"
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -894,9 +1261,15 @@ def main() -> int:
                         "understanding step")
     p.add_argument("--verbose", action="store_true",
                    help="print a live level meter")
+    p.add_argument("--asr-model", default=default_asr_model(),
+                   choices=sorted(ASR_MODELS),
+                   help="offline recogniser to load")
+    p.add_argument("--asr-threads", type=int,
+                   default=int(os.environ.get("VOICE_ASR_THREADS", "4")),
+                   help="ONNX Runtime CPU threads for the recogniser")
     args = p.parse_args()
 
-    for path in (MODEL_ONNX, MODEL_TOKENS):
+    for path in asr_model_files(args.asr_model):
         if not os.path.exists(path):
             print("missing model file: %s" % path, file=sys.stderr)
             return 2

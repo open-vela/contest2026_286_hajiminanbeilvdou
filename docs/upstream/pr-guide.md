@@ -63,7 +63,8 @@ git checkout - && git stash pop
     - `ws_server`：pong 无锁写 + 帧分两次 send 导致帧交错与 Nagle 互锁
     - `api_handler`：`CONFIG_AI_AGENT_REST_API=y` 时编译不过（缺 include/映射）
     - `tool_registry`/`tool_shell`：工具白名单与实现不一致
-  - 新功能：LVGL 聊天 UI（含 PTT）、麦克风上行 `mic_stream`、`cmd_mic` 调试命令、内置 CJK 字体
+  - 新功能：四页 LVGL UI（主页/对话/状态/设置，含 PTT）、麦克风上行 `mic_stream`、
+    `cmd_mic` 调试命令、内置 CJK 字体、`GET /api/health` 健康探测
   - 验证平台：黄山派 SF32LB52，连续运行 6 分钟无掉线
 
 ### PR 2 — `vendor_sifli`
@@ -75,6 +76,8 @@ git checkout - && git stash pop
     （调用 `HAL_AUCODEC_Refgen_Init` 与 `Config_ADCPath_Volume`——两者在 HAL 头文件中均无声明，
     驱动内以显式原型声明；**建议后续在 HAL 头文件中补上声明**）
   - 新增板级配置 `configs/agent/`（录音 + UI + PPP 相关开关）
+  - `rcS` 开机自启：无头 `ai_agent` 后台启动，`pppd` 前台接管 `/dev/console`，
+    避免 NSH 与 PPP 抢占同一串口
   - GCC14 修复：`arm_lowprintf` 缺原型、`sifli_i2cbus_initialize` 无公开声明
 
 ### PR 3 — `apps`

@@ -24,8 +24,26 @@
 
 #include "agent_compat.h"
 
+typedef struct {
+    int listen_fd;
+    bool running;
+    uint32_t clients;
+    uint32_t last_accept_ms;
+    uint32_t tx_ok;
+    uint32_t tx_fail;
+    uint32_t tx_timeout;
+    uint32_t rx_frames;
+    uint32_t client_drops;
+} ws_server_stats_t;
+
+void ws_server_get_stats(ws_server_stats_t *out);
+
 int ws_server_start(void);
 int ws_server_send(const char *chat_id, const char *text);
+/* Like ws_server_send(), but tags the frame as an intermediate "status"
+ * rather than a final "response". Hosts use the distinction to keep the
+ * uplink paused while the agent is still working. */
+int ws_server_send_status(const char *chat_id, const char *text);
 int ws_server_send_json(const char *chat_id, const char *json);
 /* 广播控制帧给所有已连接客户端。用于事件源头在设备侧、却不知道宿主
  * chat_id 的场景（屏幕上的 PTT 按钮就是：拿不到 chat_id，建屏时宿主
@@ -33,3 +51,14 @@ int ws_server_send_json(const char *chat_id, const char *json);
 int ws_server_broadcast_json(const char *json);
 int ws_server_send_binary(const char *chat_id, const void *data, size_t len);
 int ws_server_stop(void);
+
+/* Listener-only restart: rebinds the accept socket without touching the
+ * client table or s_running.  Used by the health monitor when the accept
+ * thread has stopped answering but existing sessions are still fine.
+ */
+int ws_server_listener_restart(void);
+
+/* Disconnect the client with the most failed sends (shutdown, not close:
+ * the client thread owns the fd and will clean it up).
+ */
+int ws_server_drop_worst_client(void);

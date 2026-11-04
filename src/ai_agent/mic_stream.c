@@ -34,27 +34,32 @@
 
 #ifdef CONFIG_SF32LB52_AUDCODEC
 
-/* 5801 Hz, G.711 mu-law, one byte per sample.
+/* 8462 Hz, G.711 mu-law, one byte per sample.
  *
- * The rate is set by the link, not by the recogniser. The PPP connection
- * under this board delivers about 6 KB/s of payload; 8 kHz of mu-law needs
- * 8 KB/s and does not fit, and overrunning the link does not degrade
- * gracefully -- the reader falls behind, the DMA ring laps, and the missing
- * samples are replaced by whatever came a second later. 5801 Hz of mu-law is
- * 5.8 KB/s and arrives contiguous, and 2.9 kHz of audio band is close to what
- * the telephone network gives a recogniser.
+ * Measured with `mic_rate 10 9 1` on this board: clk_div 9 / osr_sel 1
+ * produces 8462 Hz.  A 60 s soak at this setting sustained 8.40 KB/s with
+ * zero ping loss, and a 17.4 kHz 4-bit IMA ADPCM experiment showed that
+ * 8.0-8.4 KB/s is the practical link ceiling (the tighter stream lost ~8%
+ * of its samples).  This setting therefore keeps the wider 4.2 kHz band
+ * while staying inside the link's reliable budget.
  *
- * 5801 is not a design choice, it is what the ADC actually produces at
- * clk_div 7 / osr_sel 3, measured with mic_rate. The value matters because it
- * is what the far end resamples from: announcing anything else shifts the
- * whole spectrum, which a recogniser notices. Re-measure after touching
- * either divider.
+ * The rate must be what the ADC actually produces, not a nominal value:
+ * announcing anything else shifts the whole spectrum, which a recogniser
+ * notices.  Re-measure with mic_rate after touching either divider.
  *
  * The delivered byte rate equals MIC_STREAM_RATE exactly while nothing is
  * dropped, so the receiver's byte counter is the check to make.
  */
 
-#define MIC_STREAM_RATE    5801
+#define MIC_STREAM_RATE    8462
+#define MIC_STREAM_CLK_DIV 9
+#define MIC_STREAM_OSR_SEL 1
+
+/* The driver defaults to +30 dB, which saturates the on-board MEMS mic at
+ * normal speaking distance (peak 32767 with hundreds of clipped samples).
+ * 18 dB leaves headroom while keeping speech well above the ADC noise floor;
+ * the host high-pass and ASR front end handle the rest. */
+#define MIC_STREAM_VOLUME_DB 18
 
 static pthread_t s_thread;
 static volatile bool s_running;
@@ -67,7 +72,7 @@ static int  s_samples = MIC_STREAM_DEF_SAMPLES;
  */
 
 static int16_t s_block[MIC_STREAM_MAX_SAMPLES];
-static uint8_t s_ulaw[MIC_STREAM_MAX_SAMPLES];
+static uint8_t s_encoded[MIC_STREAM_MAX_SAMPLES];
 
 /****************************************************************************
  * Name: mic_ulaw_encode
@@ -128,8 +133,21 @@ static void* mic_stream_thread(void* arg)
         ws_server_send_json(s_chat_id, fmt);
     }
 
-    if (!sf32lb_audcodec_is_open()) {
-        int ret = sf32lb_audcodec_open(MIC_STREAM_RATE);
+    /* Re-open so the requested clock dividers always take effect.  The
+     * previous capture may have been started by mic_test/mic_rate with a
+     * different divider pair; reusing it would silently stream at the old
+     * rate while announcing the new one. */
+    if (sf32lb_audcodec_is_open()) {
+        sf32lb_audcodec_close();
+        usleep(50000);
+    }
+
+    sf32lb_audcodec_set_clk(MIC_STREAM_CLK_DIV, MIC_STREAM_OSR_SEL);
+
+    {
+        int ret = sf32lb_audcodec_open_ex(MIC_STREAM_RATE,
+                                          SF32LB_AUDIO_CLK_PLL, 0,
+                                          MIC_STREAM_VOLUME_DB);
         if (ret < 0) {
             syslog(LOG_ERR, "[mic_stream] open failed (%d)\n", ret);
             s_running = false;
@@ -147,11 +165,11 @@ static void* mic_stream_thread(void* arg)
         }
 
         for (i = 0; i < n; i++) {
-            s_ulaw[i] = mic_ulaw_encode(s_block[i]);
+            s_encoded[i] = mic_ulaw_encode(s_block[i]);
         }
 
         /* A failed send means the client went away; stop rather than spin. */
-        if (ws_server_send_binary(s_chat_id, s_ulaw, (size_t)n) != OK) {
+        if (ws_server_send_binary(s_chat_id, s_encoded, (size_t)n) != OK) {
             syslog(LOG_WARNING, "[mic_stream] send failed, stopping\n");
             break;
         }
@@ -228,6 +246,11 @@ bool mic_stream_is_running(void)
     return s_running;
 }
 
+int mic_stream_set_volume(int volume_db)
+{
+    return sf32lb_audcodec_set_volume(volume_db);
+}
+
 #else /* !CONFIG_SF32LB52_AUDCODEC */
 
 int mic_stream_start(const char* chat_id, int samples)
@@ -245,6 +268,12 @@ int mic_stream_stop(void)
 bool mic_stream_is_running(void)
 {
     return false;
+}
+
+int mic_stream_set_volume(int volume_db)
+{
+    (void)volume_db;
+    return ERROR;
 }
 
 #endif /* CONFIG_SF32LB52_AUDCODEC */

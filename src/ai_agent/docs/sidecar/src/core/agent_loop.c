@@ -24,6 +24,7 @@
 
 #include "core/agent_loop.h"
 #include "core/agent_mem.h"
+#include "core/health_monitor.h"
 #include "core/agent_trace.h"
 #include "core/context_builder.h"
 #include "core/message_bus.h"
@@ -58,6 +59,22 @@ static const char* TAG = "agent";
 static char* handle_slash_note(const agent_msg_t* msg);
 static char* handle_slash_remind(const agent_msg_t* msg);
 static bool llm_call_timed_out(uint32_t latency_ms);
+
+/* Every LLM call goes through here so the health monitor can tell a long
+ * cloud request apart from a dead agent loop.  A 180 s request is normal;
+ * an agent that has been "in LLM" for 16 minutes is not.
+ */
+static int agent_llm_call(const char* system_prompt, cJSON* messages,
+    const char* tools_json, llm_response_t* resp)
+{
+    int err;
+
+    health_monitor_beat_busy(HEALTH_BEAT_AGENT_LLM, true);
+    err = llm_chat_tools(system_prompt, messages, tools_json, resp);
+    health_monitor_beat_busy(HEALTH_BEAT_AGENT_LLM, false);
+
+    return err;
+}
 
 /* ── Timeout message constants ─────────────────────────────── */
 
@@ -199,6 +216,8 @@ static void add_tool_result_messages(cJSON* messages,
 {
     int n = resp->call_count;
 
+    health_monitor_beat_busy(HEALTH_BEAT_AGENT_TOOL, true);
+
     if (n == 1) {
         const llm_tool_call_t* call = &resp->calls[0];
 
@@ -219,6 +238,7 @@ static void add_tool_result_messages(cJSON* messages,
         cJSON_AddStringToObject(result_msg, "tool_call_id", call->id);
         cJSON_AddStringToObject(result_msg, "content", tool_output);
         cJSON_AddItemToArray(messages, result_msg);
+        health_monitor_beat_busy(HEALTH_BEAT_AGENT_TOOL, false);
         return;
     }
 
@@ -308,6 +328,8 @@ static void add_tool_result_messages(cJSON* messages,
             free(tasks[i].output);
         }
     }
+
+    health_monitor_beat_busy(HEALTH_BEAT_AGENT_TOOL, false);
 }
 
 /* ── Fast path counters ─────────────────────────────────── */
@@ -822,7 +844,7 @@ static char* force_finish_reply(const char* system_prompt,
     char* result = NULL;
     struct timeval t0, t1;
     gettimeofday(&t0, NULL);
-    int err = llm_chat_tools(system_prompt, messages, NULL, &resp);
+    int err = agent_llm_call(system_prompt, messages, NULL, &resp);
     gettimeofday(&t1, NULL);
     uint32_t ms = calc_elapsed_ms(&t0, &t1);
     bool timed_out = llm_call_timed_out(ms);
@@ -906,6 +928,7 @@ static void send_working_status(const agent_msg_t* msg, int iteration)
 
     strncpy(status.channel, msg->channel, sizeof(status.channel) - 1);
     strncpy(status.chat_id, msg->chat_id, sizeof(status.chat_id) - 1);
+    status.status = 1;
     status.content = strdup(
         s_working_phrases[(unsigned)rand() % WORKING_PHRASE_COUNT]);
     if (status.content) {
@@ -992,7 +1015,7 @@ static char* handle_task_complete(const char* sys_prompt, cJSON* messages,
     char* result = NULL;
     struct timeval t0, t1;
     gettimeofday(&t0, NULL);
-    int err = llm_chat_tools(sys_prompt, messages, NULL, &final_resp);
+    int err = agent_llm_call(sys_prompt, messages, NULL, &final_resp);
     gettimeofday(&t1, NULL);
     uint32_t ms = calc_elapsed_ms(&t0, &t1);
     bool timed_out = llm_call_timed_out(ms);
@@ -1068,7 +1091,7 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
         llm_response_t resp;
         struct timeval tv_start, tv_end;
         gettimeofday(&tv_start, NULL);
-        int err = llm_chat_tools(sys_prompt, messages, tools_json, &resp);
+        int err = agent_llm_call(sys_prompt, messages, tools_json, &resp);
         gettimeofday(&tv_end, NULL);
         uint32_t latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
 
@@ -1086,7 +1109,7 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
                 trace.backend_idx = next_idx;
                 llm_response_free(&resp);
                 gettimeofday(&tv_start, NULL);
-                err = llm_chat_tools(sys_prompt, messages,
+                err = agent_llm_call(sys_prompt, messages,
                     tools_json, &resp);
                 gettimeofday(&tv_end, NULL);
                 latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
@@ -1186,7 +1209,7 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
                     trace.backend_idx = prem_idx;
 
                     gettimeofday(&tv_start, NULL);
-                    err = llm_chat_tools(sys_prompt, messages,
+                    err = agent_llm_call(sys_prompt, messages,
                         tools_json, &resp);
                     gettimeofday(&tv_end, NULL);
                     latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
@@ -1462,7 +1485,27 @@ static void* agent_loop_task(void* arg)
 
     while (!agent_shutdown_requested()) {
         agent_msg_t msg;
+
+#ifdef CONFIG_AI_AGENT_HEALTH_TEST
+        /* HIL: block the loop on purpose so the health rules can be
+         * observed escalating.  Never compiled into a production image.
+         */
+        while (health_monitor_fault_agent_stall()) {
+            sleep(1);
+        }
+#endif
+
+        health_monitor_beat(HEALTH_BEAT_AGENT_IDLE);
+#ifdef CONFIG_AI_AGENT_HEALTH
+        /* Wake every few seconds so the idle heartbeat stays meaningful.
+         * With an indefinite wait the loop looks identical to a dead thread
+         * after one sample, which is exactly the false positive the health
+         * monitor must not have.
+         */
+        int err = message_bus_pop_inbound(&msg, 5000);
+#else
         int err = message_bus_pop_inbound(&msg, UINT32_MAX);
+#endif
 
         if (err != OK) {
             continue;

@@ -1,8 +1,8 @@
 diff --git a/examples/pppd/pppd_main.c b/examples/pppd/pppd_main.c
-index ce80ae90b..ffbe0a5a8 100644
+index ce80ae90b..f2015dfe1 100644
 --- a/examples/pppd/pppd_main.c
 +++ b/examples/pppd/pppd_main.c
-@@ -50,17 +50,16 @@
+@@ -50,17 +50,17 @@
   * Private Data
   ****************************************************************************/
  
@@ -16,12 +16,13 @@ index ce80ae90b..ffbe0a5a8 100644
 +/* Null-modem link (direct wire to a host pppd server): no AT dialing,
 + * the PPP peer is already on the wire.  NULL scripts skip chat entirely.
 + */
-+static FAR const char *connect_script = NULL;
-+static FAR const char *disconnect_script = NULL;
  
 -static FAR const char disconnect_script[] =
 -  "\"\" ATZ "
 -  "OK \\c";
++static FAR const char *connect_script = NULL;
++static FAR const char *disconnect_script = NULL;
++
 +/* Local address to request during IPCP (192.168.223.2).  The host side is
 + * configured with the matching 192.168.223.1:192.168.223.2 pair.
 + */
@@ -29,15 +30,20 @@ index ce80ae90b..ffbe0a5a8 100644
  
  /****************************************************************************
   * Public Functions
-@@ -76,7 +75,12 @@ int main(int argc, char *argv[])
+@@ -72,11 +72,17 @@ static FAR const char disconnect_script[] =
+ 
+ int main(int argc, char *argv[])
+ {
++  /* The board registers the console UART only as /dev/console (the ttySx
++   * loop in sifli_uart.c explicitly skips it), so that is the line that
++   * actually carries the CH340 link the peer is on.
++   */
++
+   const struct pppd_settings_s pppd_settings =
    {
      .disconnect_script = disconnect_script,
      .connect_script = connect_script,
 -    .ttyname = "/dev/ttyS1",
-+    /* The board registers the console UART only as /dev/console (the ttySx
-+     * loop in sifli_uart.c explicitly skips it), so that is the line that
-+     * actually carries the CH340 link the peer is on.
-+     */
 +    .ttyname = "/dev/console",
 +    .local_ip = { .s_addr = htonl(PPP_LOCAL_IP) },
  #ifdef CONFIG_NETUTILS_PPPD_PAP
@@ -94,7 +100,7 @@ index 56636998e..a2010e78b 100644
        printip(ctx->local_ip);
  #ifdef IPCP_GET_PRI_DNS
 diff --git a/netutils/pppd/ppp.c b/netutils/pppd/ppp.c
-index 0e27617fd..3066b5434 100644
+index 0e27617fd..403297ab1 100644
 --- a/netutils/pppd/ppp.c
 +++ b/netutils/pppd/ppp.c
 @@ -45,6 +45,7 @@
@@ -121,19 +127,20 @@ index 0e27617fd..3066b5434 100644
    /* Enable PPP */
  
    ctx->ppp_flags = PPP_RX_READY;
-@@ -218,11 +228,26 @@ void ppp_poll(FAR struct ppp_context_s *ctx)
+@@ -218,11 +228,27 @@ void ppp_poll(FAR struct ppp_context_s *ctx)
  
    ctx->ip_len = 0;
  
 -  ++ctx->ip_no_data_time;
 -  if (ctx->ip_no_data_time > PPP_IP_TIMEOUT)
-+  /* "No IP traffic for six hours, hang up" is a dial-up rule: an idle phone
-+   * line costs money, so the modem drops it. A direct serial link has nothing
-+   * to hang up and nothing to redial, so here the rule can only do harm --
-+   * and it fires far sooner than six hours anyway, because the counter is
-+   * bumped once per call to ppp_poll() rather than once per second. The
-+   * caller polls in a loop, so a link carrying traffic reaches a nominal
-+   * 21600 in minutes and tears itself down mid-transfer.
++  /* "No IP traffic for six hours, hang up" is a dial-up rule: an idle
++   * phone line costs money, so the modem drops it. A direct serial link
++   * has nothing to hang up and nothing to redial, so here the rule can
++   * only do harm -- and it fires far sooner than six hours anyway,
++   * because the counter is bumped once per call to ppp_poll() rather
++   * than once per second. The caller polls in a loop, so a link carrying
++   * traffic reaches a nominal 21600 in minutes and tears itself down
++   * mid-transfer.
 +   *
 +   * Only apply it when a connect script exists, i.e. when there really is a
 +   * modem to reconnect.
@@ -153,7 +160,7 @@ index 0e27617fd..3066b5434 100644
  
    if (!(ctx->ppp_flags & PPP_RX_READY))
 diff --git a/netutils/pppd/ppp_conf.h b/netutils/pppd/ppp_conf.h
-index 7768dff90..f922171c7 100644
+index 7768dff90..963e4aec5 100644
 --- a/netutils/pppd/ppp_conf.h
 +++ b/netutils/pppd/ppp_conf.h
 @@ -56,9 +56,40 @@
@@ -167,9 +174,9 @@ index 7768dff90..f922171c7 100644
 + *
 + * Left at 1024 because it has to move together with CONFIG_NET_TUN_PKTSIZE.
 + * Raising both lifts the TCP MSS off 256 and recovers about a fifth of the
-+ * link, but it also destabilises this board's PPP link -- the interface stops
-+ * answering LCP echo. See the note on CONFIG_NET_TUN_PKTSIZE in the agent
-+ * defconfig before changing either.
++ * link, but it also destabilises this board's PPP link -- the interface
++ * stops answering LCP echo. See the note on CONFIG_NET_TUN_PKTSIZE in the
++ * agent defconfig before changing either.
 + */
 +
 +#define PPP_RX_BUFFER_SIZE      1024

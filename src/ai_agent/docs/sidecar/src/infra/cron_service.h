@@ -94,3 +94,15 @@ int cron_remove_job(const char *job_id);
  * @return Number of jobs actually copied
  */
 int cron_list_jobs(cron_job_t *out, int max_count);
+
+/* O(1) health view: no job-array copy, safe to poll from another thread. */
+typedef struct {
+    bool running;
+    uint32_t beat_ms;       /* CLOCK_MONOTONIC, 0 = never */
+    uint32_t fires;
+    uint32_t errors;
+    uint32_t last_fire_ms;  /* CLOCK_MONOTONIC, 0 = never */
+    uint16_t job_count;
+} cron_service_health_t;
+
+void cron_service_get_health(cron_service_health_t *out);

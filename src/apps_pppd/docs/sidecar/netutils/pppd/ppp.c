@@ -228,13 +228,14 @@ void ppp_poll(FAR struct ppp_context_s *ctx)
 
   ctx->ip_len = 0;
 
-  /* "No IP traffic for six hours, hang up" is a dial-up rule: an idle phone
-   * line costs money, so the modem drops it. A direct serial link has nothing
-   * to hang up and nothing to redial, so here the rule can only do harm --
-   * and it fires far sooner than six hours anyway, because the counter is
-   * bumped once per call to ppp_poll() rather than once per second. The
-   * caller polls in a loop, so a link carrying traffic reaches a nominal
-   * 21600 in minutes and tears itself down mid-transfer.
+  /* "No IP traffic for six hours, hang up" is a dial-up rule: an idle
+   * phone line costs money, so the modem drops it. A direct serial link
+   * has nothing to hang up and nothing to redial, so here the rule can
+   * only do harm -- and it fires far sooner than six hours anyway,
+   * because the counter is bumped once per call to ppp_poll() rather
+   * than once per second. The caller polls in a loop, so a link carrying
+   * traffic reaches a nominal 21600 in minutes and tears itself down
+   * mid-transfer.
    *
    * Only apply it when a connect script exists, i.e. when there really is a
    * modem to reconnect.

@@ -13,9 +13,9 @@
 
 | 补丁 | 目标仓库 | 规模 | 内容 |
 |---|---|---|---|
-| `patches/01-ai_agent.patch` | `packages/ai_agent` | 26 个文件 | LVGL 聊天 UI（含 PTT）、麦克风上行 `mic_stream`、`cmd_mic` 调试命令、GB2312 中文字体、WS 服务器（二进制帧/发送锁/广播）、消息总线镜像上屏、LLM 看门狗、技能描述解析修复、工具裁剪、时钟窗口与偏移、TLS 单次写上限 |
-| `patches/02-vendor_sifli.patch` | `vendor/sifli` | 8 个文件 | **AUDCODEC ADC 录音驱动**（`sf32lb_audcodec.c/.h` + Kconfig/CMakeLists 挂载）、板级 defconfig（`configs/agent/`）、GCC14 缺原型修复 |
-| `patches/03-apps-pppd.patch` | `apps` | 6 个文件 | pppd 直连（空 modem 脚本、`/dev/console`、`local_ip` 字段）、拨号时代自毁逻辑修复 |
+| `patches/01-ai_agent.patch` | `packages/ai_agent` | 39 个文件 | 四页 LVGL UI（主页时钟/状态卡、对话+PTT、状态页、设置页）、时间自动同步、状态采样线程、麦克风上行 `mic_stream`（8462 Hz / 18 dB 增益）、`cmd_mic` 调试命令、GB2312 中文字体、WS 服务器（二进制帧/发送锁/广播）、WS `status`/`ui_notice`/`health` 协议、PTT 超时解锁、网络重连、heartbeat/cron 路径修复、消息总线镜像上屏、LLM 看门狗、技能描述解析修复、工具裁剪、时钟窗口与偏移、TLS 单次写上限、`GET /api/health`；**2026-11 新增端侧健康子系统**（`health_monitor` / `health_store` / `tool_device_health`、`/api/health/ack`、测试用 `/api/health/fault`、状态页健康圆点/横幅）；`PUT /api/config` 现在同时刷新 LLM router 与 `llm_proxy` 静态配置，修复配置下发后首轮 LLM 调用不出网；设置页新增「模型来源」本地 mock / 云端 LLM 切换（`/api/llm/mode`、`api_llm_set_mode`） |
+| `patches/02-vendor_sifli.patch` | `vendor/sifli` | 11 个文件 | **AUDCODEC ADC 录音驱动**（`sf32lb_audcodec.c/.h` + Kconfig/CMakeLists 挂载）、**BBRAM 封装**（`sf32lb_bbram.c/.h`，健康状态持久化）、板级 defconfig（`configs/agent/`，含 8.46 kHz / 18 dB / Montserrat 24/48 及健康/复位开关）、`rcS` 开机自启（无头 `ai_agent` + `pppd`）、`sifli_ap.c` 复位原因捕获、GCC14 缺原型修复 |
+| `patches/03-apps-pppd.patch` | `apps` | 6 个文件 | pppd 直连（空 modem 脚本、`/dev/console`、`local_ip` 字段）、拨号时代自毁逻辑修复、nxstyle 格式修正 |
 
 ## 二、部署步骤（在一个干净的同版本工作树上）
 
@@ -42,20 +42,29 @@ cd <工作树>
 ⚠️ 改了 `defconfig` 后必须 `rm -rf cmake_out/sf32lb52_lchspi_ulp_agent` 再编译，
 否则 CMake 不会重跑配置阶段，宏静默不生效。
 
+⚠️ `rcS` 由 NuttX ROMFS **原样打包源码**（不是预处理产物），里面**不能写注释**：
+`#` 会被 C 预处理器当指令报错，`/* */` 会被 NSH 当命令执行
+（实测启动打印 `nsh: /*: command not found`，脚本在 `pppd` 前中断）。
+改 `rcS` 后同样建议清 `cmake_out` 再全量构建。
+
 烧录：Windows 侧 `sftool`，板载 CH340 串口。注意 `--before soft_reset` 不会驱动 RTS，
 需先用 RTS 脉冲复位（ROM bootloader 只监听约 2 秒的 ATSF32 窗口），再以 `--before no_reset` 连接。
 
 ## 四、`src/` 与 `docs/upstream/` 的关系
 
 ```
-src/ai_agent/            自研新增源文件（mic_stream、cmd_mic、字体、UI）
+src/ai_agent/            自研新增源文件（mic_stream、cmd_mic、字体、UI、
+                         health_monitor / health_store / tool_device_health）
 src/ai_agent/docs/sidecar/   01 补丁触及的既有文件的"修改后"版本（可直接阅读）
-src/vendor_sifli/        自研 AUDCODEC 驱动 + 头文件
+src/vendor_sifli/        自研 AUDCODEC 驱动 + BBRAM 封装 + 头文件
 src/vendor_sifli/docs/sidecar/   02 补丁触及的既有文件
 src/apps_pppd/           pppd 修改后的源文件
 src/apps_pppd/docs/sidecar/      03 补丁触及的既有文件
 board/sf32lb52_agent/defconfig   板级配置（与 02 补丁内的一份相同）
 ```
+
+端侧健康子系统的设计、规则、软复位门禁与 2026-11-04 HIL 实测记录见
+[`../health-subsystem.md`](../health-subsystem.md)。
 
 sidecar 是为了评审方便：不用打补丁就能直接读改动后的完整文件。
 
