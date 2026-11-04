@@ -1,9 +1,12 @@
 #!/bin/bash
 # Point the device's agent at an LLM endpoint.
 #
-#   ./set_llm.sh real        # the real API, details from ~/.llm_env
+#   ./set_llm.sh real        # point the device at the PC-side real-API proxy
 #   ./set_llm.sh mock        # back to the local scripted mock (offline demo)
 #   ./set_llm.sh show        # what the device is using right now
+#
+# The device always talks plain HTTP to the PC on 192.168.223.1:8080.
+# The real API key stays in ~/.llm_env and is used only by llm_proxy.py.
 #
 # Configuration lives in ~/.llm_env, which is OUTSIDE every repository:
 #
@@ -35,16 +38,18 @@ fi
 
 case "${1:-show}" in
   mock)
-    HOST="$PC_IP"; PORTNUM=8080; PATHV="/v1/chat/completions"
+    HOST="$PC_IP"; PORTNUM=8081; PATHV="/v1/chat/completions"
     MODEL="mock-model"; KEY="dummy-key"
-    WHAT="local mock (offline; no key needed)"
+    WHAT="local mock on :8081 (offline; no key needed)"
     ;;
   real)
     : "${LLM_HOST:?not set in $ENV_FILE}" "${LLM_PORT:?}" \
       "${LLM_PATH:?}" "${LLM_MODEL:?}" "${LLM_API_KEY:?}"
-    HOST="$LLM_HOST"; PORTNUM="$LLM_PORT"; PATHV="$LLM_PATH"
-    MODEL="$LLM_MODEL"; KEY="$LLM_API_KEY"
-    WHAT="$LLM_HOST:$LLM_PORT $LLM_MODEL"
+    # Never send the real key to the device. Point it at the PC proxy;
+    # proxy_restart.sh holds the credentials and rewrites the model.
+    HOST="$PC_IP"; PORTNUM=8080; PATHV="/v1/chat/completions"
+    MODEL="proxy-model"; KEY="dummy-key"
+    WHAT="PC proxy at $PC_IP:8080 (real key stays on the PC)"
     ;;
   show)
     echo "=== device LLM config ==="

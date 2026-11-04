@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
-"""Headless agent + PPP, race-free, no interactive step.
+"""Reset the board; the firmware rcS autostarts ai_agent + pppd.
 
-    ai_agent < /dev/null &      # headless agent (no CLI, no exit-crash)
-    pppd                        # FOREGROUND: NSH blocks in waitpid,
-                                # pppd owns the console exclusively
+Since 2026-10-31 the boot script /etc/init.d/rcS starts the headless agent
+and runs pppd in the foreground on /dev/console (the CH340 console), so NSH
+waits in the script and never competes with PPP for the UART.
 
-LLM config is done later over REST (PUT /api/config).
+This host script therefore only pulses RTS through the bridge.  Typing
+commands into the console here would now land inside the PPP byte stream.
+
+    python3 ~/device_ppp_mode3.py
 """
 import os
 import signal
-import sys
 import time
 
-import serial
-
-PORT = os.environ.get('DEV_PORT', os.path.expanduser('~/ttyHS'))
-BAUD = 1000000
-PIDFILE = os.path.expanduser('~/bridge.pid')
+PIDFILE = os.path.expanduser("~/bridge.pid")
 
 
 def hard_reset():
@@ -25,61 +23,6 @@ def hard_reset():
     os.kill(pid, signal.SIGUSR1)
 
 
-def drain(ser, seconds, echo=True):
-    buf = bytearray()
-    end = time.time() + seconds
-    while time.time() < end:
-        data = ser.read(4096)
-        if data:
-            buf.extend(data)
-    if echo and buf:
-        sys.stdout.write(buf.decode('utf-8', errors='replace'))
-        sys.stdout.flush()
-    return bytes(buf)
-
-
-def wait_for(ser, needle, timeout):
-    buf = bytearray()
-    end = time.time() + timeout
-    while time.time() < end:
-        data = ser.read(4096)
-        if data:
-            buf.extend(data)
-            if needle.encode() in buf:
-                return True, bytes(buf)
-    return False, bytes(buf)
-
-
 hard_reset()
-time.sleep(1.0)
-
-ser = serial.Serial(PORT, BAUD, timeout=0.2)
-try:
-    ser.dtr = False
-    ser.rts = False
-except OSError:
-    pass
-
-print('=== booting ===', flush=True)
-ok, buf = wait_for(ser, 'nsh>', 25)
-sys.stdout.write(buf.decode('utf-8', errors='replace'))
-if not ok:
-    print('!! no NSH prompt', file=sys.stderr)
-    ser.close()
-    sys.exit(1)
-print('=== NSH up ===', flush=True)
-drain(ser, 1)
-
-print('=== headless ai_agent ===', flush=True)
-# NOTE: syslog now goes to the in-RAM log (CONFIG_RAMLOG_SYSLOG), so the agent's
-# "All network services started!" line no longer reaches the console. Wait a
-# fixed boot window instead; read the agent log later via run_shell dmesg or
-# GET /api/logs.
-ser.write(b'ai_agent < /dev/null &\r\n')
-drain(ser, 10)
-
-print('=== pppd FOREGROUND (NSH blocks) ===', flush=True)
-ser.write(b'pppd\r\n')
-drain(ser, 6)
-ser.close()
-print('=== device configured ===', flush=True)
+time.sleep(3)
+print("=== board reset; rcS autostarts ai_agent + pppd ===")

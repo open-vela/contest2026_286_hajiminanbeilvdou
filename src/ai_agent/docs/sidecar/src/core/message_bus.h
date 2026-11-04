@@ -43,6 +43,9 @@ typedef struct {
                           *   indistinguishable from real user input -- and the
                           *   watch screen would show the agent's own scheduler
                           *   prompt in a user bubble. */
+    uint8_t status;      /**< Non-zero: intermediate progress text ("working..."),
+                          *   not a final answer. WebSocket peers use this to
+                          *   keep the uplink paused until the real response. */
 } agent_msg_t;
 
 /** Free heap members (content, image_b64) of a message.
@@ -74,3 +77,13 @@ int message_bus_push_outbound(const agent_msg_t *msg);
 
 /** Block until an outbound message is available (or timeout expires). */
 int message_bus_pop_outbound(agent_msg_t *msg, uint32_t timeout_ms);
+
+/** Queue depths and lifetime drop counts, for the health monitor. */
+typedef struct {
+    uint16_t in_depth;
+    uint16_t out_depth;
+    uint32_t in_drops;
+    uint32_t out_drops;
+} message_bus_stats_t;
+
+void message_bus_get_stats(message_bus_stats_t *out);

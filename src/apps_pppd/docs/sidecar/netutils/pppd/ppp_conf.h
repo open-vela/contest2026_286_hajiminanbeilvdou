@@ -62,9 +62,9 @@
  *
  * Left at 1024 because it has to move together with CONFIG_NET_TUN_PKTSIZE.
  * Raising both lifts the TCP MSS off 256 and recovers about a fifth of the
- * link, but it also destabilises this board's PPP link -- the interface stops
- * answering LCP echo. See the note on CONFIG_NET_TUN_PKTSIZE in the agent
- * defconfig before changing either.
+ * link, but it also destabilises this board's PPP link -- the interface
+ * stops answering LCP echo. See the note on CONFIG_NET_TUN_PKTSIZE in the
+ * agent defconfig before changing either.
  */
 
 #define PPP_RX_BUFFER_SIZE      1024

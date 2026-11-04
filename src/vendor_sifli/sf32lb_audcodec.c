@@ -408,6 +408,31 @@ int sf32lb_audcodec_open(uint32_t sample_rate)
                                  SF32LB_AUDIO_DEFAULT_VOLUME);
 }
 
+int sf32lb_audcodec_set_volume(int volume_db)
+{
+  if (!sf32lb_audcodec_is_open())
+    {
+      return -EINVAL;
+    }
+
+  if (volume_db < SF32LB_AUDIO_VOLUME_MIN)
+    {
+      volume_db = SF32LB_AUDIO_VOLUME_MIN;
+    }
+
+  if (volume_db > SF32LB_AUDIO_VOLUME_MAX)
+    {
+      volume_db = SF32LB_AUDIO_VOLUME_MAX;
+    }
+
+  if (HAL_AUDCODEC_Config_ADCPath_Volume(&g_codec, 0, volume_db) != HAL_OK)
+    {
+      return -EIO;
+    }
+
+  return 0;
+}
+
 /****************************************************************************
  * Name: mic_copy_words
  *

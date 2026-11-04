@@ -57,6 +57,16 @@ time_t tool_get_time_offset(void)
     return s_time_known ? s_time_offset : 0;
 }
 
+bool tool_get_time_is_synced(void)
+{
+    return s_time_known;
+}
+
+time_t tool_get_time_now(void)
+{
+    return time(NULL) + tool_get_time_offset();
+}
+
 static void apply_network_time(time_t epoch)
 {
     s_time_offset = epoch - time(NULL);

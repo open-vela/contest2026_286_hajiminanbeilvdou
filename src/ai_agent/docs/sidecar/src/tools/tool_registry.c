@@ -28,6 +28,7 @@
 #include "tools/tool_guard.h"
 #include "tools/tool_control.h"
 #include "tools/tool_cron.h"
+#include "tools/tool_device_health.h"
 #include "tools/tool_feishu_chat.h"
 #include "tools/tool_feishu_doc.h"
 #include "tools/tool_fetch_url.h"
@@ -119,6 +120,7 @@ static void register_tool(const agent_tool_t* tool)
  * single place to change.
  */
 static const char* const s_exposed_tools[] = {
+    "get_health",        /* one structured device snapshot */
     "run_shell",         /* telemetry, dmesg, ping */
     "read_file",         /* skills are read with this one */
     "write_file",        /* notes and memory */
@@ -388,6 +390,12 @@ int tool_registry_init(void)
 #endif
 
     /* System state tools */
+    REGISTER_TOOL_NO_PARAMS(
+        "get_health",
+        "Get one structured device health snapshot: status, heap, tasks, "
+        "network, WebSocket clients, microphone, cron, LLM and issues.",
+        tool_get_health_execute);
+
     REGISTER_TOOL_NO_PARAMS(
         "get_battery",
         "Get battery level, charging status, voltage, temperature.",

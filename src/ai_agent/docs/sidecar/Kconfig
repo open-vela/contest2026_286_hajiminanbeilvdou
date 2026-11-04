@@ -324,4 +324,66 @@ config AI_AGENT_REST_API
 		server for remote configuration, skill management, and
 		log retrieval from Android companion App.
 
+config AI_AGENT_HEALTH
+	bool "Device health monitor"
+	default n
+	---help---
+		Sample heap, task, network, WebSocket, microphone, cron, LLM
+		and message-bus state every few seconds, publish a single
+		snapshot, and expose it through /api/health, the watch screen
+		and the get_health agent tool.  Rules and the recovery state
+		machine build on the same snapshot.
+
+config AI_AGENT_HEALTH_INTERVAL_MS
+	int "Health sample interval (ms)"
+	default 5000
+	range 1000 60000
+	depends on AI_AGENT_HEALTH
+	---help---
+		How often the sampler refreshes the snapshot.  Five seconds is
+		short enough to notice a stalled thread and long enough that
+		mallinfo() and nxsched_foreach() are cheap.
+
+config AI_AGENT_HEALTH_STACKSIZE
+	int "Health sampler stack size"
+	default 16384
+	depends on AI_AGENT_HEALTH
+
+config AI_AGENT_HEALTH_AUTORESET
+	bool "Allow health-initiated soft reset"
+	default n
+	depends on AI_AGENT_HEALTH && BOARDCTL_RESET
+	---help---
+		Permit the health state machine to call boardctl(BOARDIOC_RESET)
+		after a critical, recoverable fault has persisted through the
+		grace period and the reset budget.  Off by default: a reset
+		takes /data with it, so it must be an explicit choice.
+
+config AI_AGENT_HEALTH_PERSIST
+	bool "Persist boot count and last anomaly in RTC backup registers"
+	default y
+	depends on AI_AGENT_HEALTH && ARCH_CHIP_SF32LB52
+	---help---
+		Keep a small boot/reset/anomaly record across resets in two RTC
+		backup registers.  Everything else is deliberately ephemeral.
+
+config AI_AGENT_HEALTH_BBRAM_PRIMARY_IDX
+	int
+	default 5
+	depends on AI_AGENT_HEALTH_PERSIST
+
+config AI_AGENT_HEALTH_BBRAM_ANOMALY_IDX
+	int
+	default 6
+	depends on AI_AGENT_HEALTH_PERSIST
+
+config AI_AGENT_HEALTH_TEST
+	bool "Health fault injection endpoint"
+	default n
+	depends on AI_AGENT_HEALTH && AI_AGENT_REST_API
+	---help---
+		Add POST /api/health/fault so the HIL scripts can inject
+		stalls, read errors, send failures and heap pressure on
+		demand.  Never enable on a production device.
+
 endif

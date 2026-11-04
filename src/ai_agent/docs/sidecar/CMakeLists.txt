@@ -53,6 +53,7 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     src/tools/tool_shell.c
     src/tools/tool_system.c
     src/tools/tool_health.c
+    src/tools/tool_device_health.c
     src/tools/tool_control.c
     src/tools/tool_media.c
     src/tools/tool_proxyquickapp.c
@@ -97,6 +98,13 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
 
   if(CONFIG_AI_AGENT_TEST)
     list(APPEND AGENT_SRCS tests/integs/test_vision_integ.c)
+  endif()
+
+  if(CONFIG_AI_AGENT_HEALTH)
+    list(APPEND AGENT_SRCS
+      src/core/health_monitor.c
+      src/infra/health_store.c
+    )
   endif()
 
   if(CONFIG_AI_AGENT_LVGL_UI)
@@ -212,7 +220,7 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     list(APPEND AGENT_INCDIRS ${BES_AEC_INC})
   endif()
 
-  if(CONFIG_SF32LB52_AUDCODEC)
+  if(CONFIG_SF32LB52_AUDCODEC OR CONFIG_AI_AGENT_HEALTH_PERSIST)
     list(APPEND AGENT_INCDIRS ${SIFLI_CHIP_INC})
   endif()
 

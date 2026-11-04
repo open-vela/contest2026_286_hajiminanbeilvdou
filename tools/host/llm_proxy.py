@@ -32,6 +32,7 @@ runs with no network -- pass --fallback-mock to enable that.
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -159,15 +160,43 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    port = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() \
-        else 8080
+    port = 8080
+    # Only the PPP peer needs this port. Binding to 0.0.0.0 would let any
+    # process on the WSL/Windows LAN use the proxy's real API key.
+    bind = os.environ.get("LLM_PROXY_BIND", "192.168.223.1")
+    argv = sys.argv[1:]
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--bind" and i + 1 < len(argv):
+            bind = argv[i + 1]
+            i += 2
+            continue
+        if arg.startswith("--bind="):
+            bind = arg.split("=", 1)[1]
+        elif arg.isdigit():
+            port = int(arg)
+        i += 1
+
     if not API_KEY:
         print("no LLM_API_KEY in %s -- run ~/setup_llm.sh" % ENV_FILE)
         return 1
-    print("[proxy] listening on 0.0.0.0:%d -> %s (%s)%s"
-          % (port, API_URL, API_MODEL,
+
+    httpd = None
+    while httpd is None:
+        try:
+            httpd = ThreadingHTTPServer((bind, port), Handler)
+        except OSError as exc:
+            # ppp0 may not exist yet at boot; keep trying rather than
+            # falling back to a publicly reachable address.
+            print("[proxy] cannot bind %s:%d (%s); retrying in 2s"
+                  % (bind, port, exc), flush=True)
+            time.sleep(2)
+
+    print("[proxy] listening on %s:%d -> %s (%s)%s"
+          % (bind, port, API_URL, API_MODEL,
              "  [mock fallback on]" if USE_FALLBACK else ""), flush=True)
-    ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
+    httpd.serve_forever()
     return 0
 
 

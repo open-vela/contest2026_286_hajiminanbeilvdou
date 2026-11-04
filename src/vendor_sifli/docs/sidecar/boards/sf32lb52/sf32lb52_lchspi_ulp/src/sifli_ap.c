@@ -35,6 +35,10 @@
 #  include <nuttx/timers/rtc.h>
 #endif
 
+#ifdef CONFIG_BOARDCTL_RESET_CAUSE
+#  include <sys/boardctl.h>
+#endif
+
 #include "arm_internal.h"
 #include "sf32lb52_lchspi_ulp.h"
 #include "bf0_hal.h"
@@ -602,9 +606,65 @@ void board_early_initialize(void)
  *
  ****************************************************************************/
 
+#ifdef CONFIG_BOARDCTL_RESET_CAUSE
+/* HAL_PMU_CheckBootMode() clears the PMU status as a side effect, so it
+ * must be called exactly once, before anything else can consume it.  The
+ * result is cached here for board_reset_cause().
+ */
+
+static enum boardioc_reset_cause_e g_reset_cause = BOARDIOC_RESETCAUSE_UNKOWN;
+
+static void board_capture_reset_cause(void)
+{
+  PMU_BootModeTypeDef mode;
+  uint32_t wakeup_src = 0;
+
+  if (HAL_PMU_CheckBootMode(&mode, &wakeup_src) != HAL_OK)
+    {
+      return;
+    }
+
+  switch (mode)
+    {
+      case PMU_REBOOT_BOOT:
+        /* boardctl(BOARDIOC_RESET), up_systemreset() and similar */
+        g_reset_cause = BOARDIOC_RESETCAUSE_CORE_SOFT;
+        break;
+
+      case PMU_HIBERNATE_BOOT:
+      case PMU_SHUTDOWN_BOOT:
+        g_reset_cause = BOARDIOC_RESETCAUSE_LOWPOWER;
+        break;
+
+      case PMU_COLD_BOOT:
+      default:
+        g_reset_cause = BOARDIOC_RESETCAUSE_SYS_CHIPPOR;
+        break;
+    }
+}
+
+int board_reset_cause(struct boardioc_reset_cause_s *cause)
+{
+  if (cause == NULL)
+    {
+      return -EINVAL;
+    }
+
+  cause->cause = g_reset_cause;
+  cause->flag = 0;
+  return OK;
+}
+#endif
+
 #ifdef CONFIG_BOARD_LATE_INITIALIZE
 void board_late_initialize(void)
 {
+#ifdef CONFIG_BOARDCTL_RESET_CAUSE
+  /* Must run before anything else touches the PMU status. */
+
+  board_capture_reset_cause();
+#endif
+
   /* Perform board-specific initialization */
 
   sf32lb52_lchspi_ulp_bringup();

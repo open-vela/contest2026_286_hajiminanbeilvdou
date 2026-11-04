@@ -7,16 +7,19 @@
 不需要任何人开口。
 
 - **喊一声就能下命令**：说「你好openvela」唤醒（也可以点屏幕上的 PTT 按钮）→
-  设备麦克风采集 → PC 端离线 ASR（sherpa-onnx Paraformer）→ 命令路由 → LLM 理解 →
+  设备麦克风采集 → PC 端离线 ASR（sherpa-onnx，FireRedASR2-AED / Paraformer）→ 命令路由 → LLM 理解 →
   设备执行（查时间 / 设定时任务 / 读内存 / 上屏）
 - **主动巡检**：定时唤醒 agent，自动执行巡检并把结果推上屏幕与 PC 端，无需唤醒词
-- **屏上有中文**：自研 LVGL 聊天 UI + 内置 GB2312 中文字体（openvela 自带字体无 CJK 字形）
+- **设备自己会看病**（2026-11 扩展）：端侧健康监测线程统一采集堆/任务/网络/WS/麦克风/cron/LLM，
+  规则 + 趋势判定 → 先重启服务、必要时门禁内软复位；boot/复位原因/最近异常写入 RTC 备份寄存器。
+  详见 [`docs/health-subsystem.md`](docs/health-subsystem.md)
+- **屏上有中文**：自研四页 LVGL UI（主页时钟/状态卡、对话、状态页、设置页）+ 内置 GB2312 中文字体（openvela 自带字体无 CJK 字形）
 - **零 WiFi 依赖**：板载无 WiFi，网络走 PPP over 串口；PC 端做 NAT 网关与 LLM 代理
 
 亮点在于**把一条不可能的组合跑通了**：无网卡设备 + 串口 12.7 KB/s 的实际带宽预算下，
-用 G.711 μ-law 把音频压到 5.8 KB/s 上行（单字节/样本 @5801 Hz，不丢样本），
-配合 PC 端离线识别，实现了「喊一声 → 设备执行 → 结果上屏」的完整闭环，
-并连续运行 6 分钟零掉线。
+用 G.711 μ-law 把音频压到 8.46 KB/s 上行（单字节/样本 @8462 Hz），
+配合 PC 端离线识别（FireRedASR2-AED / Paraformer），实现了「喊一声 → 设备执行 → 结果上屏」的完整闭环。
+8.46 kHz 配置实测连续 60 秒零丢包；更早的 5.8 kHz 配置曾连续 6 分钟零掉线。
 
 ## 二、选题方向
 
@@ -31,16 +34,19 @@
 ```
 app/agent_voice/        应用层入口（manifest 映射到 packages/demos/）
 board/sf32lb52_agent/   板级 defconfig（录音 / LVGL UI / 工具集 / 网络 全部开关）
-src/ai_agent/           自研源文件：LVGL 聊天 UI、麦克风上行 mic_stream、
-                        cmd_mic 调试命令、GB2312 中文字体
+src/ai_agent/           自研源文件：四页 LVGL UI、麦克风上行 mic_stream、
+                        cmd_mic 调试命令、GB2312 中文字体、健康监测
+                        （health_monitor / health_store / tool_device_health）
 src/ai_agent/docs/sidecar/          既有文件的"改动后"版本（免打补丁即可阅读）
 src/vendor_sifli/       AUDCODEC ADC 录音驱动（openvela 全树首个可用的录音实现）
+                        + BBRAM 封装（健康状态持久化）
 src/apps_pppd/          pppd 直连（空 modem）改动后的源文件
 docs/upstream/          ★ 部署说明 + 三个补丁（复现本作品从这里开始）
+docs/health-subsystem.md  端侧健康监测/告警/自治恢复设计与 HIL 实测
 docs/*.md|txt           设计与开发计划文档
 deliverable/            《作品介绍文档》（.md / .docx）与《演示视频脚本》
 tools/host/             PC 端完整工具链：串口桥、PPP 服务端、LLM 代理、
-                        语音桥、看门狗、诊断脚本（共 36 个）
+                        语音桥、看门狗、健康故障注入、诊断脚本（共 41 个）
 logs/Oliweitz/          AI Coding 全量对话日志
 ```
 
@@ -60,7 +66,7 @@ logs/Oliweitz/          AI Coding 全量对话日志
 
 | 硬件 | 说明 |
 |---|---|
-| 黄山派开发板（SF32LB52-LCHSPI-ULP） | 板载 MEMS 麦克风 + 圆屏 + CH340 串口 |
+| 黄山派开发板（SF32LB52-LCHSPI-ULP） | 板载 MEMS 麦克风 + 390×450 触屏（UI 运行时读取分辨率） + CH340 串口 |
 | PC（Linux / WSL2 Ubuntu） | 本作品的"云侧"：ASR、LLM 代理、PPP 服务端 |
 | USB 数据线 | 唯一连接：串口既是控制台/烧录口，也是 PPP 网络链路 |
 
@@ -98,16 +104,46 @@ cp <本仓>/tools/host/* ~/ && cd ~ && python3 -m venv voiceenv
 # 2) 起串口桥（必须先于复位板子：桥独占 CH340，避免打开串口时的 RTS 抖动复位）
 bash ~/bridge_restart.sh
 
-# 3) 一键拉起全链路 + 自检（复位板子 → 无头 agent → pppd → PC 侧 PPP/NAT/LLM → 语音桥）
+# 3) 一键拉起全链路 + 自检（复位板子 → rcS 自动启动无头 agent + pppd → PC 侧 PPP/NAT/LLM → 语音桥）
 bash ~/voice_ready.sh
 ```
 
-看到 `READY` 即全链路就绪（自检包含：NSH 起来 → PPP 通 → agent 端口可达 → LLM 配置下发 → 音频流心跳）。
+看到 `READY` 即全链路就绪（自检包含：rcS 自启动 agent/pppd → PPP 通 → agent 端口可达 → LLM 配置下发 → 音频流心跳）。
+
+> 2026-10-31 起固件的 `/etc/init.d/rcS` 会自动执行 `ai_agent < /dev/null &` 和
+> `pppd`（前台，接管 `/dev/console`）。因此 `device_ppp_mode3.py` 只负责 RTS 复位，
+> 不再向控制台输入命令；`nsh_run.py` 这类需要 NSH 提示符的调试方式要先临时清空
+> rcS 或终止 pppd。
 LLM 通道默认走本地 mock（离线可演示）；要接真实 API：
 
 ```bash
 bash ~/setup_llm.sh        # 交互式填写 API 地址/Key，只存在 PC 本地，不进任何提交物
 bash ~/proxy_restart.sh    # 设备走明文 HTTP 到 PC，PC 转 HTTPS 出网
+bash ~/set_llm.sh real     # 把设备配置指向 PC 代理（真实 key 留在 PC）
+```
+
+> 2026-11-04 已用真实 DeepSeek 实测：设备经 PC 代理拿到真实回答（`deepseek-chat`，
+> 首轮约 2.8 s）。`voice_ready.sh` 会重新下发 mock 配置，重启链路后需要再执行一次
+> `set_llm.sh real`。
+>
+> 同时修复了一个配置下发缺陷：`PUT /api/config` 原先只重载 LLM router，没有刷新
+> `llm_proxy` 自己的 host/port/api_key 静态配置，导致“配置已下发但首轮 LLM 调用因
+> 空 key 直接返回、连 TCP 都不发”。现在两者同时刷新，配置立即生效。
+
+**设备屏切换模型来源（2026-11）**：设置页新增「模型来源」卡片，显示 `本地 mock` 或
+`云端 LLM`，点「切换」即可。PC 侧需要同时跑两个端点：
+
+```bash
+bash ~/proxy_restart.sh    # mock:8081 + 真实代理:8080
+```
+
+`voice_ready.sh` 默认下发**本地 8081**；切到云端后请求走 PC 代理 8080，真实 key 仍只在 PC。
+也可以从命令行切换（body-less 形式避开设备上不稳定的 POST body 读取）：
+
+```bash
+curl http://192.168.223.2:28789/api/llm/mode
+curl -X POST 'http://192.168.223.2:28789/api/llm/mode?mode=cloud'
+curl -X POST 'http://192.168.223.2:28789/api/llm/mode?mode=local'
 ```
 
 ### 4.4 使用
@@ -137,7 +173,16 @@ bash ~/proxy_restart.sh    # 设备走明文 HTTP 到 PC，PC 转 HTTPS 出网
 ```bash
 python3 ~/ws_chat.py "你好"          # 文本直发 agent
 curl http://192.168.223.2:28789/api/config   # 查看/下发 LLM 配置
+curl http://192.168.223.2:28789/api/health   # 健康快照（legacy 四字段 + heap/tasks/
+                                             #   net/ws/mic/cron/llm/bus/beats/issues）
+curl -X POST http://192.168.223.2:28789/api/health/ack   # 主机重配置后清复位预算
+curl http://192.168.223.2:28789/api/llm/mode              # 当前模型来源（local/cloud）
+curl -X POST 'http://192.168.223.2:28789/api/llm/mode?mode=cloud'  # 切云端
 ```
+
+> HIL 固件额外开放 `POST /api/health/fault`（`CONFIG_AI_AGENT_HEALTH_TEST=y`），
+> 用 `tools/host/health_fault.sh` 注入 mic/agent/网络/堆/WS 故障，详见
+> [`docs/health-subsystem.md`](docs/health-subsystem.md)。生产固件应关闭该开关。
 
 **c) 主动能力**——不碰设备，等待定时任务触发即可在屏幕上看到巡检结果。
 
@@ -152,12 +197,33 @@ curl http://192.168.223.2:28789/api/config   # 查看/下发 LLM 配置
 
 - 链路断了：`bash ~/pipeline_watchdog.sh` 自动检测恢复；重来一遍 `voice_ready.sh`
 - 重启后 LLM 配置丢失：正常现象（`/data` 是 tmpfs），`voice_ready.sh` 会自动重新下发
+- 设备自己复位了：先看 `GET /api/health` 的 `reset_reason`（`health_auto` 表示健康系统
+  在服务级恢复失败后做的门禁软复位）与 `last_anomaly`；用 `voice_ready.sh --no-reset`
+  重新下发配置并 `POST /api/health/ack`，不要再用 RTS 复位覆盖证据
 - 想看设备日志：控制台已让给 PPP（RAMLOG 方案），用 `run_shell dmesg` 或 REST `GET /api/logs`
 - 串口速率实测只有 ~12.7 KB/s：这是 CH340+USB/IP 的物理上限，音频码率已按此预算设计
 
+### 4.6 端侧健康监测（2026-11 扩展）
+
+设备端每 5 s 采样一次，产出统一健康快照：
+
+- `starting / ok / degraded / critical` 四态 + `issues[]`（规则、严重度、连续次数）
+- 覆盖堆（低/碎片/趋势）、任务数/线程心跳、网络 down/时延、WS accept 与发送失败、
+  麦克风停采/错误、cron、LLM、消息总线
+- 恢复顺序：重启 mic → WS listener-only 重启 / drop 问题 client → 门禁内软复位
+- 软复位前把 boot 次数、复位原因、最近异常写入 RTC BKP5/BKP6；`persist_ok=false` 时
+  由主机日志兜底
+- 主机 `pipeline_watchdog.sh` 在设备 `reboot_pending/handling` 期间不重复整板复位，
+  恢复成功后自动 ack
+
+2026-11-04 已完成 Phase 4 HIL：mic 重启、agent 45 s 停顿自恢复、net_down 只告警不复位、
+WS 发送失败 drop client、heap trend 与永久 agent stall 两次 `health_auto` 软复位均通过。
+设计、阈值、实测记录与已知限制见 [`docs/health-subsystem.md`](docs/health-subsystem.md)。
+
 ## 五、AI Coding 使用说明
 
-本作品全程用 Claude Code 开发（赛事规定时间内完成于 2026-09-12 ~ 09-17 共 5 天）：
+本作品全程用 Claude Code 开发（赛事规定时间内完成于 2026-09-12 ~ 09-17 共 5 天；
+2026-11-03 ~ 11-04 的端侧健康子系统扩展同样由 Claude Code 完成）：
 
 - **需求拆解 / 方案设计**：用 AI 对比「设备直连 LLM vs PC 代理」「有无 WiFi 的可行路径」，
   最终定下 PPP-over-串口 + PC 代理的架构

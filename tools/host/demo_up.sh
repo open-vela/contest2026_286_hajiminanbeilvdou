@@ -36,8 +36,10 @@ if [ "$MOCK" = "1" ]; then
   # shows nothing until it writes 4 KB -- which is forever at one line per
   # request, and makes "the mock was never called" and "the mock was called
   # and chose badly" look identical.
-  nohup python3 -u "$HOME/mock_llm.py" 8080 > "$HOME/mock_llm.log" 2>&1 &
-  echo "[demo] mock LLM on 0.0.0.0:8080 (log: ~/mock_llm.log)"
+  # 8081, not 8080: the real-API proxy keeps 8080 so the device can switch
+  # between local mock and cloud from its settings page.
+  nohup python3 -u "$HOME/mock_llm.py" 8081 > "$HOME/mock_llm.log" 2>&1 &
+  echo "[demo] mock LLM on 0.0.0.0:8081 (log: ~/mock_llm.log)"
 fi
 
 # --- PPP server -----------------------------------------------------------

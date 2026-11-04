@@ -56,6 +56,41 @@ static volatile bool s_cron_running;
 static pthread_mutex_t s_cron_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t s_cron_wake = PTHREAD_COND_INITIALIZER;
 
+/* Health counters.  Kept separate from the job table so that a sampler can
+ * read them without walking (or copying) sixteen full job records.
+ */
+static volatile uint32_t s_health_beat_ms;
+static volatile uint32_t s_health_fires;
+static volatile uint32_t s_health_errors;
+static volatile uint32_t s_health_last_fire_ms;
+
+static uint32_t cron_now_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)((uint32_t)ts.tv_sec * 1000u
+        + (uint32_t)ts.tv_nsec / 1000000u);
+}
+
+void cron_service_get_health(cron_service_health_t *out)
+{
+    if (out == NULL) {
+        return;
+    }
+
+    pthread_mutex_lock(&s_cron_lock);
+    out->running = s_cron_running;
+    out->job_count = (uint16_t)s_job_count;
+    pthread_mutex_unlock(&s_cron_lock);
+
+    out->beat_ms = __atomic_load_n(&s_health_beat_ms, __ATOMIC_RELAXED);
+    out->fires = __atomic_load_n(&s_health_fires, __ATOMIC_RELAXED);
+    out->errors = __atomic_load_n(&s_health_errors, __ATOMIC_RELAXED);
+    out->last_fire_ms = __atomic_load_n(&s_health_last_fire_ms,
+        __ATOMIC_RELAXED);
+}
+
 /* -- Private Functions ------------------------------------------- */
 
 static bool cron_sanitize_destination(cron_job_t* job)
@@ -327,6 +362,10 @@ static int cron_save_jobs(void)
 
 static void cron_fire_job(cron_job_t* job, time_t now)
 {
+    __atomic_fetch_add(&s_health_fires, 1, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_health_last_fire_ms, cron_now_ms(),
+        __ATOMIC_RELAXED);
+
     syslog(LOG_INFO, "[%s] Cron job firing: %s (%s)\n", TAG, job->name, job->id);
 
     if (job->wake_agent) {
@@ -345,10 +384,12 @@ static void cron_fire_job(cron_job_t* job, time_t now)
             syslog(LOG_INFO, "[%s] Waking agent: channel=%s chat_id=%s\n",
                 TAG, msg.channel, msg.chat_id);
             if (message_bus_push_inbound(&msg) != OK) {
+                __atomic_fetch_add(&s_health_errors, 1, __ATOMIC_RELAXED);
                 syslog(LOG_WARNING, "[%s] Failed to wake agent\n", TAG);
                 free(msg.content);
             }
         } else {
+            __atomic_fetch_add(&s_health_errors, 1, __ATOMIC_RELAXED);
             syslog(LOG_WARNING, "[%s] OOM waking agent\n", TAG);
         }
 
@@ -368,6 +409,7 @@ static void cron_fire_job(cron_job_t* job, time_t now)
             tool_output, sizeof(tool_output));
 
         if (err != OK) {
+            __atomic_fetch_add(&s_health_errors, 1, __ATOMIC_RELAXED);
             syslog(LOG_WARNING, "[%s] Action %s failed: %s\n",
                 TAG, job->action, tool_output);
         } else {
@@ -392,8 +434,12 @@ static void cron_fire_job(cron_job_t* job, time_t now)
             notify.content = strdup(job->message);
             if (notify.content) {
                 if (message_bus_push_outbound(&notify) != OK) {
+                    __atomic_fetch_add(&s_health_errors, 1,
+                        __ATOMIC_RELAXED);
                     free(notify.content);
                 }
+            } else {
+                __atomic_fetch_add(&s_health_errors, 1, __ATOMIC_RELAXED);
             }
         }
     } else {
@@ -407,9 +453,12 @@ static void cron_fire_job(cron_job_t* job, time_t now)
         if (msg.content) {
             int err = message_bus_push_outbound(&msg);
             if (err != OK) {
+                __atomic_fetch_add(&s_health_errors, 1, __ATOMIC_RELAXED);
                 syslog(LOG_WARNING, "[%s] Failed to push cron message\n", TAG);
                 free(msg.content);
             }
+        } else {
+            __atomic_fetch_add(&s_health_errors, 1, __ATOMIC_RELAXED);
         }
     }
 
@@ -472,6 +521,8 @@ static void* cron_task_main(void* arg)
          * wake us immediately when a new job is added.  This also
          * survives NuttX deep-sleep better than plain usleep. */
         struct timespec ts;
+        __atomic_store_n(&s_health_beat_ms, cron_now_ms(),
+            __ATOMIC_RELAXED);
         clock_gettime(CLOCK_REALTIME, &ts);
         ts.tv_sec += AGENT_CRON_CHECK_INTERVAL_MS / 1000;
 

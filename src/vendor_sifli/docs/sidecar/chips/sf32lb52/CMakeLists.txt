@@ -54,6 +54,10 @@ if(CONFIG_SF32LB52_AUDCODEC)
     list(APPEND SRCS sf32lb_audcodec.c)
 endif()
 
+if(CONFIG_AI_AGENT_HEALTH_PERSIST)
+    list(APPEND SRCS sf32lb_bbram.c)
+endif()
+
 set(IPC_QUEUE_SRCS
     ${NUTTX_CHIP_ABS_DIR}/ipc_queue/common/circular_buf.c
     ${NUTTX_CHIP_ABS_DIR}/ipc_queue/common/ipc_hw.c

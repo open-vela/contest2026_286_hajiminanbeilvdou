@@ -17,11 +17,22 @@ PORT=28789
 BRIDGE_LOG="$HOME/voice_test.log"
 BRIDGE_PID_FILE="$HOME/voice_bridge.pid"
 
-if [ "${1:-}" = "--stop" ]; then
-  pkill -f voice_bridge.py 2>/dev/null && echo "voice bridge stopped" \
-    || echo "voice bridge was not running"
-  exit 0
-fi
+NO_RESET=0
+for arg in "$@"; do
+  case "$arg" in
+    --stop)
+      pkill -f voice_bridge.py 2>/dev/null && echo "voice bridge stopped" \
+        || echo "voice bridge was not running"
+      exit 0
+      ;;
+    --no-reset)
+      # Use this after the device reset itself (health_auto): the board is
+      # already booting, and another reset would just throw away the boot
+      # counter we are trying to observe.
+      NO_RESET=1
+      ;;
+  esac
+done
 
 step() { printf '\n=== %s ===\n' "$1"; }
 ok()   { printf '  OK   %s\n' "$1"; }
@@ -37,8 +48,12 @@ pkill -f voice_bridge.py 2>/dev/null
 # mysteriously stops, not as anything obviously wrong with the setup.
 sudo -n pkill -f "pppd $HOME/ttyHS" 2>/dev/null
 sleep 1
-python3 -u "$HOME/device_ppp_mode3.py" 2>&1 | tail -21 | tail -1
-ok "device configured"
+if [ "$NO_RESET" = "1" ]; then
+  ok "device reset skipped (--no-reset)"
+else
+  python3 -u "$HOME/device_ppp_mode3.py" 2>&1 | tail -21 | tail -1
+  ok "device configured"
+fi
 
 # --- 2. PC side: NAT + mock LLM + pppd server -------------------------------
 step "2/5 PC: NAT + mock LLM + pppd server"
@@ -71,7 +86,7 @@ fi
 step "4/5 provision LLM config"
 curl -sS -X PUT "http://$DEV_IP:$PORT/api/config" \
   -H 'Content-Type: application/json' \
-  -d "{\"llm_host\":\"$PC_IP\",\"llm_port\":\"8080\",\"llm_path\":\"/v1/chat/completions\",\"model\":\"mock-model\",\"api_key\":\"dummy-key\"}" \
+  -d "{\"llm_host\":\"$PC_IP\",\"llm_port\":\"8081\",\"llm_path\":\"/v1/chat/completions\",\"model\":\"mock-model\",\"api_key\":\"dummy-key\"}" \
   > /dev/null 2>&1
 MODEL=$(timeout 15 curl -sS "http://$DEV_IP:$PORT/api/config" 2>/dev/null \
         | sed -n 's/.*"model":"\([^"]*\)".*/\1/p')
@@ -79,6 +94,25 @@ if [ -n "$MODEL" ]; then
   ok "model=$MODEL"
 else
   bad "config did not take"; exit 1
+fi
+
+# /data is a tmpfs, so a health-initiated soft reset arrives here without
+# its LLM config. Now that it has been reapplied, tell the device so it can
+# clear safe_mode and its auto-reset budget.
+health=$(timeout 6 curl -sS "http://$DEV_IP:$PORT/api/health" 2>/dev/null || true)
+if [ -n "$health" ]; then
+  hstatus=$(printf '%s' "$health" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p')
+  hboot=$(printf '%s' "$health" | sed -n 's/.*"boot_count":\([0-9]*\).*/\1/p')
+  hreason=$(printf '%s' "$health" | sed -n 's/.*"reset_reason":"\([^"]*\)".*/\1/p')
+  ok "health=${hstatus:-?} boot=${hboot:-?} reset=${hreason:-?}"
+  if timeout 4 curl -sS -X POST "http://$DEV_IP:$PORT/api/health/ack" \
+       > /dev/null 2>&1; then
+    ok "health ack"
+  else
+    bad "health ack failed"
+  fi
+else
+  bad "health endpoint did not answer"
 fi
 
 # --- 5. bridge, then prove audio is arriving --------------------------------

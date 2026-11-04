@@ -22,6 +22,10 @@
 
 #include "channels/ws_server.h"
 #include "channels/mic_stream.h"
+#include "core/health_monitor.h"
+#ifdef CONFIG_AI_AGENT_LVGL_UI
+#include "ui/lvgl_ui_channel.h"
+#endif
 #include "core/message_bus.h"
 #ifdef CONFIG_AI_AGENT_NODE
 #include "node/node_manager.h"
@@ -32,6 +36,8 @@
 #include "infra/api_handler.h"
 #endif
 
+#include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -87,6 +93,7 @@ typedef struct {
      * order taken anywhere, so it cannot deadlock.
      */
     pthread_mutex_t tx_mtx;
+    uint32_t tx_fail;
     unsigned char   scratch[WS_FRAME_SCRATCH];
 } ws_client_t;
 
@@ -94,8 +101,48 @@ static ws_client_t s_clients[AGENT_WS_MAX_CLIENTS];
 static pthread_mutex_t s_clients_mtx = PTHREAD_MUTEX_INITIALIZER;
 static bool s_tx_mtx_ready = false;
 
-static int s_listen_fd = -1;
+static volatile int s_listen_fd = -1;
 static volatile bool s_running = false;
+static volatile bool s_accept_running = false;
+static volatile bool s_accept_exited = true;
+static pthread_t s_accept_thread;
+
+/* Counters for the health monitor.  Individual increments are relaxed: a
+ * reader only needs a recent value, not a consistent set.
+ */
+static volatile uint32_t s_tx_ok;
+static volatile uint32_t s_tx_fail;
+static volatile uint32_t s_tx_timeout;
+static volatile uint32_t s_rx_frames;
+static volatile uint32_t s_client_drops;
+static volatile uint32_t s_client_count;
+static volatile uint32_t s_last_accept_ms;
+
+static uint32_t ws_now_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)((uint32_t)ts.tv_sec * 1000u
+        + (uint32_t)ts.tv_nsec / 1000000u);
+}
+
+void ws_server_get_stats(ws_server_stats_t *out)
+{
+    if (out == NULL) {
+        return;
+    }
+
+    out->listen_fd = s_listen_fd;
+    out->running = s_running;
+    out->clients = __atomic_load_n(&s_client_count, __ATOMIC_RELAXED);
+    out->last_accept_ms = __atomic_load_n(&s_last_accept_ms, __ATOMIC_RELAXED);
+    out->tx_ok = __atomic_load_n(&s_tx_ok, __ATOMIC_RELAXED);
+    out->tx_fail = __atomic_load_n(&s_tx_fail, __ATOMIC_RELAXED);
+    out->tx_timeout = __atomic_load_n(&s_tx_timeout, __ATOMIC_RELAXED);
+    out->rx_frames = __atomic_load_n(&s_rx_frames, __ATOMIC_RELAXED);
+    out->client_drops = __atomic_load_n(&s_client_drops, __ATOMIC_RELAXED);
+}
 
 /* ── Client helpers ───────────────────────────────────────────── */
 
@@ -170,6 +217,8 @@ static ws_client_t* add_client_locked(int fd)
         if (!s_clients[i].active) {
             s_clients[i].fd = fd;
             s_clients[i].active = true;
+            s_clients[i].tx_fail = 0;
+            __atomic_fetch_add(&s_client_count, 1, __ATOMIC_RELAXED);
             snprintf(s_clients[i].chat_id, sizeof(s_clients[i].chat_id), "ws_%d", fd);
             syslog(LOG_INFO, "[%s] Client connected: %s (fd=%d)\n", TAG,
                 s_clients[i].chat_id, fd);
@@ -193,6 +242,7 @@ static void remove_client_locked(int fd)
             s_clients[i].active = false;
             s_clients[i].fd = -1; /* invalidate fd before closing */
             pthread_mutex_unlock(&s_clients[i].tx_mtx);
+            __atomic_fetch_sub(&s_client_count, 1, __ATOMIC_RELAXED);
 
             close(fd);
             return;
@@ -290,6 +340,15 @@ static int ws_send_frame_op(ws_client_t* client, const void* payload,
     int hdr_len = 0;
     int fd = client->fd;
 
+#ifdef CONFIG_AI_AGENT_HEALTH_TEST
+    if (health_monitor_fault_take_ws_fail()) {
+        client->tx_fail++;
+        __atomic_fetch_add(&s_tx_timeout, 1, __ATOMIC_RELAXED);
+        errno = ETIMEDOUT;
+        return -1;
+    }
+#endif
+
     hdr[0] = (unsigned char)(0x80 | opcode); /* FIN + opcode */
     if (len < 126) {
         hdr[1] = (unsigned char)len;
@@ -320,9 +379,20 @@ static int ws_send_frame_op(ws_client_t* client, const void* payload,
         memcpy(client->scratch + hdr_len, payload, len);
         if (send(fd, client->scratch, hdr_len + len, 0) != hdr_len + (int)len)
           {
+            client->tx_fail++;
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+              {
+                __atomic_fetch_add(&s_tx_timeout, 1, __ATOMIC_RELAXED);
+              }
+            else
+              {
+                __atomic_fetch_add(&s_tx_fail, 1, __ATOMIC_RELAXED);
+              }
+
             return -1;
           }
 
+        __atomic_fetch_add(&s_tx_ok, 1, __ATOMIC_RELAXED);
         return 0;
       }
 
@@ -339,6 +409,23 @@ static int ws_send_frame_op(ws_client_t* client, const void* payload,
     memcpy(big, hdr, hdr_len);
     memcpy(big + hdr_len, payload, len);
     int rc = (send(fd, big, hdr_len + len, 0) == hdr_len + (int)len) ? 0 : -1;
+    if (rc == 0)
+      {
+        __atomic_fetch_add(&s_tx_ok, 1, __ATOMIC_RELAXED);
+      }
+    else
+      {
+        client->tx_fail++;
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+          {
+            __atomic_fetch_add(&s_tx_timeout, 1, __ATOMIC_RELAXED);
+          }
+        else
+          {
+            __atomic_fetch_add(&s_tx_fail, 1, __ATOMIC_RELAXED);
+          }
+      }
+
     free(big);
     return rc;
 }
@@ -508,6 +595,7 @@ typedef struct {
 static void* client_thread(void* arg)
 {
     client_arg_t ca = *(client_arg_t*)arg;
+    pthread_setname_np(pthread_self(), "ws_client");
     free(arg);
     int fd = ca.fd;
 
@@ -585,6 +673,7 @@ static void* client_thread(void* arg)
     ws_client_t* client = add_client_locked(fd);
     if (!client) {
         pthread_mutex_unlock(&s_clients_mtx);
+        __atomic_fetch_add(&s_client_drops, 1, __ATOMIC_RELAXED);
         syslog(LOG_WARNING, "[%s] Max clients reached, closing fd=%d\n", TAG, fd);
         /* Politely close */
         unsigned char close_frame[2] = { 0x88, 0x00 };
@@ -610,6 +699,8 @@ static void* client_thread(void* arg)
             break; /* clean close */
         if (n < 0)
             continue; /* ignored frame */
+
+        __atomic_fetch_add(&s_rx_frames, 1, __ATOMIC_RELAXED);
 
         /* Try Node protocol first — if handled, skip chat processing */
 #ifdef CONFIG_AI_AGENT_NODE
@@ -646,6 +737,21 @@ static void* client_thread(void* arg)
                 mic_stream_start(chat_id, samples);
             else
                 mic_stream_stop();
+            continue;
+        }
+
+        /* UI-only notice from the host (wake armed, nothing recognised,
+         * link status). It must not enter the agent bus: doing so used to
+         * run a full LLM turn for every hint. Posting it to the UI queue
+         * also clears the PTT "processing" latch, which is why the host
+         * sends these notices in the first place. */
+        if (cJSON_IsString(type_item)
+            && strcmp(type_item->valuestring, "ui_notice") == 0
+            && cJSON_IsString(content_item)) {
+#ifdef CONFIG_AI_AGENT_LVGL_UI
+            lvgl_ui_channel_post(content_item->valuestring);
+#endif
+            cJSON_Delete(root);
             continue;
         }
 
@@ -694,17 +800,27 @@ static void* client_thread(void* arg)
 static void* accept_thread(void* arg)
 {
     (void)arg;
-    while (s_running) {
-        struct pollfd pfd = { .fd = s_listen_fd, .events = POLLIN };
-        int pr = poll(&pfd, 1, 500);
-        if (pr <= 0)
-            continue;
+    pthread_setname_np(pthread_self(), "ws_accept");
+    while (s_running && s_accept_running) {
+        health_monitor_beat(HEALTH_BEAT_WS_ACCEPT);
 
         struct sockaddr_in addr;
         socklen_t addr_len = sizeof(addr);
         int cfd = accept(s_listen_fd, (struct sockaddr*)&addr, &addr_len);
-        if (cfd < 0)
+        if (cfd < 0) {
+            /* A timed poll()/accept() is exactly the shape of wait that the
+             * NuttX sem_waitirq.c:137 race strands: the network stack posts
+             * the poll semaphore around the same moment the timeout fires,
+             * and the waiter can be lost for tens of seconds.  That made
+             * WS_ACCEPT_DEAD fire on a healthy listener during HIL.  A
+             * non-blocking socket driven by a plain usleep() has no second
+             * wakeup source, so only a genuinely dead thread stops beating.
+             */
+            usleep(100 * 1000);
             continue;
+        }
+
+        __atomic_store_n(&s_last_accept_ms, ws_now_ms(), __ATOMIC_RELAXED);
 
         syslog(LOG_INFO, "[%s] accepted fd=%d from %s:%d\n", TAG, cfd,
             inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
@@ -727,10 +843,175 @@ static void* accept_thread(void* arg)
         }
         pthread_attr_destroy(&attr);
     }
+
+    s_accept_exited = true;
     return NULL;
 }
 
 /* ── Public API ───────────────────────────────────────────────── */
+
+static bool s_accept_started;
+
+static int ws_server_listener_start(void)
+{
+    pthread_attr_t attr;
+    struct sockaddr_in addr;
+    int opt = 1;
+    int fd;
+    int rc;
+
+    if (s_accept_running) {
+        return OK;
+    }
+
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        syslog(LOG_ERR, "[%s] socket() failed\n", TAG);
+        return ERROR;
+    }
+
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    /* accept_thread() polls with usleep() instead of poll(timeout); see the
+     * race explanation there.
+     */
+    opt = fcntl(fd, F_GETFL, 0);
+    if (opt >= 0) {
+        fcntl(fd, F_SETFL, opt | O_NONBLOCK);
+    }
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(AGENT_WS_PORT);
+    addr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        syslog(LOG_ERR, "[%s] bind() failed on port %d, errno=%d\n", TAG,
+            AGENT_WS_PORT, errno);
+        close(fd);
+        return ERROR;
+    }
+
+    if (listen(fd, AGENT_WS_MAX_CLIENTS) < 0) {
+        syslog(LOG_ERR, "[%s] listen() failed\n", TAG);
+        close(fd);
+        return ERROR;
+    }
+
+    s_listen_fd = fd;
+    s_accept_running = true;
+    s_accept_exited = false;
+
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, AGENT_CLI_STACK);
+
+    /* Joinable on purpose: listener restart has to know the old accept
+     * thread has stopped before it rebinds, or two threads could accept on
+     * two different sockets.
+     */
+    rc = pthread_create(&s_accept_thread, &attr, accept_thread, NULL);
+    pthread_attr_destroy(&attr);
+
+    if (rc != 0) {
+        syslog(LOG_ERR, "[%s] Failed to create accept thread\n", TAG);
+        s_accept_running = false;
+        close(fd);
+        s_listen_fd = -1;
+        return ERROR;
+    }
+
+    s_accept_started = true;
+    syslog(LOG_INFO, "[%s] listener on port %d\n", TAG, AGENT_WS_PORT);
+    return OK;
+}
+
+static int ws_server_listener_stop(void)
+{
+    int fd;
+
+    s_accept_running = false;
+
+    fd = s_listen_fd;
+    if (fd >= 0) {
+        /* Wakes poll()/accept() without touching the client fds. */
+        shutdown(fd, SHUT_RDWR);
+    }
+
+    if (s_accept_started) {
+        int waited = 0;
+
+        /* The kernel semaphore race this health subsystem exists to
+         * survive can leave the accept thread stuck in poll()/accept()
+         * with no way to wake it.  An unbounded pthread_join() would hang
+         * the health thread too -- turning a detectable fault into a
+         * silent one.  Give it two seconds, then leave it alone and let
+         * the reset budget take over.
+         */
+        while (!s_accept_exited && waited < 2000) {
+            usleep(100 * 1000);
+            waited += 100;
+        }
+
+        if (!s_accept_exited) {
+            syslog(LOG_ERR,
+                "[%s] accept thread did not stop; aborting listener restart\n",
+                TAG);
+            return ERROR;
+        }
+
+        pthread_join(s_accept_thread, NULL);
+        s_accept_started = false;
+    }
+
+    if (s_listen_fd >= 0) {
+        close(s_listen_fd);
+        s_listen_fd = -1;
+    }
+
+    return OK;
+}
+
+int ws_server_listener_restart(void)
+{
+    if (ws_server_listener_stop() != OK) {
+        return ERROR;
+    }
+
+    return ws_server_listener_start();
+}
+
+int ws_server_drop_worst_client(void)
+{
+    int fd = -1;
+    uint32_t worst = 0;
+
+    pthread_mutex_lock(&s_clients_mtx);
+    for (int i = 0; i < AGENT_WS_MAX_CLIENTS; i++) {
+        if (s_clients[i].active && s_clients[i].tx_fail > worst) {
+            worst = s_clients[i].tx_fail;
+            fd = s_clients[i].fd;
+        }
+    }
+
+    /* One or two failures happen on a healthy link; a sustained failure
+     * count is what the health monitor escalates on.  Do not punish a
+     * client for a single hiccup just because someone else's issue was
+     * aggregated into the same rule.
+     */
+    if (worst < 5) {
+        fd = -1;
+    } else if (fd >= 0) {
+        shutdown(fd, SHUT_RDWR);
+    }
+    pthread_mutex_unlock(&s_clients_mtx);
+
+    if (fd >= 0) {
+        syslog(LOG_WARNING, "[%s] dropping client fd=%d after %lu failures\n",
+            TAG, fd, (unsigned long)worst);
+        return OK;
+    }
+    return ERROR;
+}
 
 int ws_server_start(void)
 {
@@ -749,54 +1030,17 @@ int ws_server_start(void)
             s_clients[i].fd = -1;
             s_clients[i].active = false;
             s_clients[i].chat_id[0] = '\0';
+            s_clients[i].tx_fail = 0;
         }
     }
 
-    s_listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (s_listen_fd < 0) {
-        syslog(LOG_ERR, "[%s] socket() failed\n", TAG);
-        return ERROR;
-    }
-
-    int opt = 1;
-    setsockopt(s_listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    struct sockaddr_in addr = {
-        .sin_family = AF_INET,
-        .sin_port = htons(AGENT_WS_PORT),
-        .sin_addr.s_addr = INADDR_ANY,
-    };
-
-    if (bind(s_listen_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        syslog(LOG_ERR, "[%s] bind() failed on port %d, errno=%d\n", TAG,
-            AGENT_WS_PORT, errno);
-        close(s_listen_fd);
-        s_listen_fd = -1;
-        return ERROR;
-    }
-
-    if (listen(s_listen_fd, AGENT_WS_MAX_CLIENTS) < 0) {
-        syslog(LOG_ERR, "[%s] listen() failed\n", TAG);
-        close(s_listen_fd);
-        s_listen_fd = -1;
-        return ERROR;
+    if (s_running) {
+        return OK;
     }
 
     s_running = true;
-
-    pthread_t tid;
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    pthread_attr_setstacksize(&attr, AGENT_CLI_STACK);
-    int rc = pthread_create(&tid, &attr, accept_thread, NULL);
-    pthread_attr_destroy(&attr);
-
-    if (rc != 0) {
-        syslog(LOG_ERR, "[%s] Failed to create accept thread\n", TAG);
+    if (ws_server_listener_start() != OK) {
         s_running = false;
-        close(s_listen_fd);
-        s_listen_fd = -1;
         return ERROR;
     }
 
@@ -805,14 +1049,15 @@ int ws_server_start(void)
     return OK;
 }
 
-int ws_server_send(const char* chat_id, const char* text)
+static int ws_server_send_typed(const char* chat_id, const char* text,
+                                const char* type)
 {
     if (s_listen_fd < 0 || !s_running)
         return ERROR;
 
     /* Build JSON response */
     cJSON* resp = cJSON_CreateObject();
-    cJSON_AddStringToObject(resp, "type", "response");
+    cJSON_AddStringToObject(resp, "type", type);
     cJSON_AddStringToObject(resp, "content", text);
     cJSON_AddStringToObject(resp, "chat_id", chat_id);
     char* json_str = cJSON_PrintUnformatted(resp);
@@ -839,6 +1084,16 @@ int ws_server_send(const char* chat_id, const char* text)
 
     free(json_str);
     return (client == NULL) ? ERROR : (rc == 0 ? OK : ERROR);
+}
+
+int ws_server_send(const char* chat_id, const char* text)
+{
+    return ws_server_send_typed(chat_id, text, "response");
+}
+
+int ws_server_send_status(const char* chat_id, const char* text)
+{
+    return ws_server_send_typed(chat_id, text, "status");
 }
 
 /**
@@ -929,10 +1184,7 @@ int ws_server_send_binary(const char* chat_id, const void* data, size_t len)
 int ws_server_stop(void)
 {
     s_running = false;
-    if (s_listen_fd >= 0) {
-        close(s_listen_fd);
-        s_listen_fd = -1;
-    }
+    ws_server_listener_stop();
     syslog(LOG_INFO, "[%s] WebSocket server stopped\n", TAG);
     return OK;
 }

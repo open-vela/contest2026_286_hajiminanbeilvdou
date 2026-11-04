@@ -35,6 +35,7 @@
 #include "agent_config.h"
 
 #include "core/agent_loop.h"
+#include "core/health_monitor.h"
 #include "core/message_bus.h"
 #include "core/message_bus_tap.h"
 #include "channels/nsh_commands.h"
@@ -131,6 +132,7 @@ static void net_state_change_cb(net_state_t state, void* arg)
         weixin_channel_start();
 #endif
         g_net_services_started = true;
+        health_monitor_notify_services_started();
     } else if (state == NET_STATE_DISCONNECTED) {
         syslog(LOG_WARNING,
             "[%s] Network lost, services may be affected\n", TAG);
@@ -152,53 +154,74 @@ static void* network_watch_task(void* arg)
 
     network_wifi_reconnect();
 
-    if (network_wait_connected(30000) == OK) {
-        syslog(LOG_INFO, "[%s] Network connected: %s\n", TAG, network_get_ip());
+    /* PPP is brought up by the host after this process starts, and on a
+     * cold boot it can easily take longer than the old single 30-second
+     * attempt. Giving up once left agent/WS/REST down for the rest of the
+     * boot even though the link came up moments later. Keep waiting.
+     *
+     * Poll once a second so the health monitor can see this thread is
+     * alive; only log every tenth attempt to keep the RAMLOG readable.
+     */
+    int net_retries = 0;
+    while (!g_shutdown_requested) {
+        health_monitor_beat(HEALTH_BEAT_NET);
+        if (network_wait_connected(1000) == OK) {
+            break;
+        }
+        if ((++net_retries % 10) == 0) {
+            syslog(LOG_WARNING, "[%s] Network not ready yet; retrying\n",
+                TAG);
+        }
+    }
+
+    if (g_shutdown_requested) {
+        return NULL;
+    }
+
+    syslog(LOG_INFO, "[%s] Network connected: %s\n", TAG, network_get_ip());
 
 #if AGENT_SKILL_SYNC_ENABLED
-        /* Sync skills from Bitable before starting agent loop */
-        if (skill_sync_from_bitable() != OK) {
-            syslog(LOG_WARNING, "[%s] Bitable skill sync failed, using local skills\n", TAG);
-        }
+    /* Sync skills from Bitable before starting agent loop */
+    if (skill_sync_from_bitable() != OK) {
+        syslog(LOG_WARNING, "[%s] Bitable skill sync failed, using local skills\n", TAG);
+    }
 #endif
 
 #ifdef CONFIG_AI_AGENT_FEISHU
-        if (feishu_bot_start() != OK)
-            syslog(LOG_WARNING, "[%s] feishu_bot_start failed\n", TAG);
+    if (feishu_bot_start() != OK)
+        syslog(LOG_WARNING, "[%s] feishu_bot_start failed\n", TAG);
 #endif
-        if (agent_loop_start() != OK)
-            syslog(LOG_WARNING, "[%s] agent_loop_start failed\n", TAG);
-        if (ws_server_start() != OK)
-            syslog(LOG_WARNING, "[%s] ws_server_start failed\n", TAG);
+    if (agent_loop_start() != OK)
+        syslog(LOG_WARNING, "[%s] agent_loop_start failed\n", TAG);
+    if (ws_server_start() != OK)
+        syslog(LOG_WARNING, "[%s] ws_server_start failed\n", TAG);
 #ifdef CONFIG_AI_AGENT_NODE
-        if (node_client_start() != OK)
-            syslog(LOG_WARNING, "[%s] node_client_start failed\n", TAG);
+    if (node_client_start() != OK)
+        syslog(LOG_WARNING, "[%s] node_client_start failed\n", TAG);
 #endif
 #ifdef CONFIG_AI_AGENT_MQTT
-        if (mqtt_channel_start() != OK)
-            syslog(LOG_WARNING, "[%s] mqtt_channel_start failed\n", TAG);
+    if (mqtt_channel_start() != OK)
+        syslog(LOG_WARNING, "[%s] mqtt_channel_start failed\n", TAG);
 #endif
 #ifdef CONFIG_AI_AGENT_WEIXIN
-        if (weixin_channel_start() != OK)
-            syslog(LOG_WARNING, "[%s] weixin_channel_start failed\n", TAG);
+    if (weixin_channel_start() != OK)
+        syslog(LOG_WARNING, "[%s] weixin_channel_start failed\n", TAG);
 #endif
 
-        syslog(LOG_INFO, "[%s] All network services started!\n", TAG);
+    syslog(LOG_INFO, "[%s] All network services started!\n", TAG);
+    health_monitor_notify_services_started();
 
 #ifdef CONFIG_AI_AGENT_NET_RPMSG
-        g_net_services_started = true;
-#endif
-    } else {
-        syslog(LOG_WARNING, "[%s] Network timeout — net services not started.\n", TAG);
-        syslog(LOG_WARNING, "[%s] Use 'config_show' / 'set_*' CLI commands to configure.\n", TAG);
-    }
+    g_net_services_started = true;
 
-#ifdef CONFIG_AI_AGENT_NET_RPMSG
     /* Register listener for network state changes — auto-restart services on reconnect */
     network_register_listener(net_state_change_cb, NULL);
+#endif
 
-    /* Keep thread alive to handle reconnection events */
+#if defined(CONFIG_AI_AGENT_HEALTH) || defined(CONFIG_AI_AGENT_NET_RPMSG)
+    /* Keep this thread alive so its heartbeat keeps meaning something. */
     while (!g_shutdown_requested) {
+        health_monitor_beat(HEALTH_BEAT_NET);
         sleep(1);
     }
 #endif
@@ -338,14 +361,21 @@ static void* outbound_dispatch_task(void* arg)
 
     while (!g_shutdown_requested) {
         agent_msg_t msg;
-        /* Wait indefinitely rather than polling once a second. There is
-         * nothing to do on a timeout -- the loop just goes round -- and the
-         * timeout costs a full timed release-and-reacquire of the queue's
-         * mutex every second for the life of the device, which is a lot of
-         * traffic through the scheduler's mutex bookkeeping for no gain.
-         * Shutdown wakes this with a broadcast, so it cannot get stuck. */
+
+        /* With the health monitor enabled the wait is bounded to five
+         * seconds so the loop can publish a heartbeat: an outbound queue
+         * that has stopped being drained is otherwise indistinguishable
+         * from a thread that is simply idle.  Without it, wait
+         * indefinitely -- shutdown broadcasts, so it cannot get stuck.
+         */
+#ifdef CONFIG_AI_AGENT_HEALTH
+        health_monitor_beat(HEALTH_BEAT_OUTBOUND);
+        if (message_bus_pop_outbound(&msg, 5000) != OK)
+            continue;
+#else
         if (message_bus_pop_outbound(&msg, UINT32_MAX) != OK)
             continue;
+#endif
         msg.channel[sizeof(msg.channel) - 1] = '\0';
         msg.chat_id[sizeof(msg.chat_id) - 1] = '\0';
 
@@ -399,7 +429,10 @@ static void* outbound_dispatch_task(void* arg)
                     TAG);
             }
         } else if (strcmp(msg.channel, AGENT_CHAN_WEBSOCKET) == 0) {
-            ws_server_send(msg.chat_id, msg.content);
+            if (msg.status)
+                ws_server_send_status(msg.chat_id, msg.content);
+            else
+                ws_server_send(msg.chat_id, msg.content);
 #ifdef CONFIG_AI_AGENT_MQTT
         } else if (strcmp(msg.channel, AGENT_CHAN_MQTT) == 0) {
             mqtt_channel_send(msg.chat_id, msg.content);
@@ -547,6 +580,9 @@ int ai_agent_main(int argc, char* argv[])
 
         rc = session_mgr_init();
         BOOT_LOG_RC(&t0, "P1", "session_mgr_init", rc);
+
+        rc = health_monitor_init();
+        BOOT_LOG_RC(&t0, "P1", "health_monitor_init", rc);
     }
 
     /* ── Phase 2: Proxy / networking ───────────────────────── */
@@ -712,6 +748,14 @@ int ai_agent_main(int argc, char* argv[])
     }
     BOOT_LOG(&t0, "P5", "network_watch thread started (async)");
 
+    /* Health sampler: after every producer exists, so its first sample
+     * sees a fully populated system.
+     */
+    {
+        int hrc = health_monitor_start();
+        BOOT_LOG_RC(&t0, "P5", "health_monitor_start", hrc);
+    }
+
     /* ── Phase 6: CLI thread — all services now in known state ── */
     {
         int rc = nsh_commands_start();
@@ -759,6 +803,9 @@ int ai_agent_main(int argc, char* argv[])
 
     /* Give threads a moment to notice and exit */
     usleep(500 * 1000);
+
+    /* The sampler reads every other subsystem, so stop it before they go. */
+    health_monitor_stop();
 
     /* Cleanup — reverse order of init */
     tool_media_cleanup();
